@@ -3,8 +3,10 @@ import {
   absMove,
   DEFAULT_VOL_RULES,
   evaluateRules,
+  moveHurts,
   parseVolRules,
   priceAtOrBefore,
+  signedMove,
   type PricePoint,
   type VolRule,
 } from "./vol-gate.ts";
@@ -107,5 +109,83 @@ describe("evaluateRules", () => {
       { label: "15m", windowMs: 15 * MIN, thresholdPct: 0.5 },
     ];
     expect(evaluateRules(buf(end, p), oneRule).block).toBe(true);
+  });
+});
+
+describe("directional rules", () => {
+  const DIR: VolRule[] = [
+    {
+      label: "4h:dir",
+      windowMs: 4 * 60 * MIN,
+      thresholdPct: 2.0,
+      directional: true,
+    },
+  ];
+  const END = 10_000_000;
+  // 49 points at 5-min spacing spans 4h, so the 4h window is warm.
+  const flat = Array.from({ length: 49 }, () => 100);
+  const rise = [...flat.slice(0, 48), 110]; // +10% at the end
+  const fall = [...flat.slice(0, 48), 90]; // -10% at the end
+
+  it("parses the :dir suffix and labels it", () => {
+    const r = parseVolRules("48h:5:dir,15m:1.0");
+    expect(r[0]).toEqual({
+      label: "48h:dir",
+      windowMs: 48 * 60 * MIN,
+      thresholdPct: 5,
+      directional: true,
+    });
+    expect(r[1]!.directional).toBeUndefined();
+    expect(r[1]!.label).toBe("15m");
+  });
+
+  it("signedMove keeps the sign; absMove does not", () => {
+    expect(signedMove(buf(END, rise), 4 * 60 * MIN)).toBeCloseTo(0.1, 6);
+    expect(signedMove(buf(END, fall), 4 * 60 * MIN)).toBeCloseTo(-0.1, 6);
+    expect(absMove(buf(END, fall), 4 * 60 * MIN)).toBeCloseTo(0.1, 6);
+  });
+
+  it("moveHurts: a rise hurts NO, a fall hurts YES", () => {
+    expect(moveHurts(0.05, "NO")).toBe(true);
+    expect(moveHurts(0.05, "YES")).toBe(false);
+    expect(moveHurts(-0.05, "YES")).toBe(true);
+    expect(moveHurts(-0.05, "NO")).toBe(false);
+  });
+
+  it("a rise blocks NO and lets YES through", () => {
+    const b = buf(END, rise);
+    expect(evaluateRules(b, DIR, "NO").block).toBe(true);
+    expect(evaluateRules(b, DIR, "YES").block).toBe(false);
+  });
+
+  it("a fall blocks YES and lets NO through", () => {
+    const b = buf(END, fall);
+    expect(evaluateRules(b, DIR, "YES").block).toBe(true);
+    expect(evaluateRules(b, DIR, "NO").block).toBe(false);
+  });
+
+  it("with no side, a directional rule falls back to absolute", () => {
+    expect(evaluateRules(buf(END, rise), DIR).block).toBe(true);
+    expect(evaluateRules(buf(END, fall), DIR).block).toBe(true);
+  });
+
+  it("an absolute rule ignores the side entirely", () => {
+    const abs: VolRule[] = [
+      { label: "4h", windowMs: 4 * 60 * MIN, thresholdPct: 2.0 },
+    ];
+    expect(evaluateRules(buf(END, rise), abs, "YES").block).toBe(true);
+    expect(evaluateRules(buf(END, rise), abs, "NO").block).toBe(true);
+  });
+
+  it("a calm buffer blocks neither side", () => {
+    const b = buf(END, flat);
+    expect(evaluateRules(b, DIR, "NO").block).toBe(false);
+    expect(evaluateRules(b, DIR, "YES").block).toBe(false);
+  });
+
+  it("reports the move magnitude even when the side is spared", () => {
+    const d = evaluateRules(buf(END, rise), DIR, "YES");
+    expect(d.block).toBe(false);
+    expect(d.moves["4h:dir"]).toBeCloseTo(10, 4);
   });
 });
