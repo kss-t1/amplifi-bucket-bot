@@ -135,7 +135,9 @@ export interface BucketBotConfig {
    *  configured window exceeds that window's threshold. Default false. */
   volGateEnabled: boolean;
   /** Gate rules (window + threshold %). Defaults to 15m>0.8% OR 4h>2.0%.
-   *  Configure with VOL_GATE_RULES, e.g. "15m:0.8,4h:2.0,1d:5". */
+   *  Configure with VOL_GATE_RULES, e.g. "15m:0.8,4h:2.0,1d:5". A trailing
+   *  ":dir" makes a rule directional — it blocks only the side the move hurts
+   *  (a rise blocks NO, a fall blocks YES), e.g. "48h:5:dir,15m:1:dir". */
   volRules: VolRule[];
   /** Milliseconds between BTC spot polls feeding the gate. Default 20_000. */
   btcVolPollMs: number;

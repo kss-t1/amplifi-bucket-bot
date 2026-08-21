@@ -557,15 +557,28 @@ export class BucketBot implements Stoppable {
     // the user spec is "rebalance daily as day-1 markets resolve", so we
     // hold every filled slot to resolution and only redeploy after the
     // natural resolution event frees that capital.
-    // Fleet-wide gate on opening NEW positions (vol gate + re-entry cooldown).
-    // Both signals are BTC-wide / bot-wide, not per-target, so evaluate once;
-    // existing positions, TP, and closes are unaffected.
-    const openBlock = this.shouldBlockOpens(now.getTime());
-    if (openBlock && targets.length > 0)
-      this.logger.info("skip opens — gate", openBlock);
-    // Reset the per-episode dedup on any calm cycle so a fresh turbulence
-    // episode re-records the then-current would-be opens.
-    if (!openBlock) this.blockLoggedKeys.clear();
+    // Gate on opening NEW positions (vol gate + re-entry cooldown). A
+    // directional vol rule blocks only the side the BTC move hurts, so
+    // evaluate once per side; existing positions, TP, and closes are
+    // unaffected.
+    const blockBySide: Record<"YES" | "NO", Record<string, unknown> | null> = {
+      YES: this.shouldBlockOpens(now.getTime(), "YES"),
+      NO: this.shouldBlockOpens(now.getTime(), "NO"),
+    };
+    const anyBlock = blockBySide.YES ?? blockBySide.NO;
+    if (anyBlock && targets.length > 0)
+      this.logger.info("skip opens — gate", {
+        YES: blockBySide.YES,
+        NO: blockBySide.NO,
+      });
+    // Reset the per-episode dedup per SIDE, so a side that has gone calm
+    // re-records its would-be opens on its next episode even while the other
+    // side stays blocked. Slot keys end in `|YES` / `|NO`.
+    for (const side of ["YES", "NO"] as const) {
+      if (blockBySide[side]) continue;
+      for (const key of this.blockLoggedKeys)
+        if (key.endsWith(`|${side}`)) this.blockLoggedKeys.delete(key);
+    }
     // Blocking new opens is not enough: a resting maker BUY placed in a calm
     // cycle still sits in the book and FILLS if the spike sweeps through it,
     // re-arming the very directional exposure the gate exists to prevent
@@ -573,13 +586,14 @@ export class BucketBot implements Stoppable {
     // mid-spike while the gate correctly blocked fresh opens). So whenever
     // opens are gated, also CANCEL the bot's own still-resting, zero-fill open
     // orders. Filled slots (positionId set) keep riding to resolution untouched.
-    if (openBlock) await this.cancelRestingOpensOnBlock(openBlock);
+    if (anyBlock) await this.cancelRestingOpensOnBlock(blockBySide);
 
     for (const t of targets) {
       const key = slotKey(t.eventSlug, t.marketSlug, t.outcome);
       if (this.state.openByKey[key]) continue;
-      if (openBlock) {
-        this.recordBlockedOpen(key, t, openBlock, now.getTime());
+      const gated = blockBySide[t.outcome];
+      if (gated) {
+        this.recordBlockedOpen(key, t, gated, now.getTime());
         continue;
       }
       if (!this.passesStabilityGate(t, now)) continue;
@@ -666,17 +680,22 @@ export class BucketBot implements Stoppable {
   /**
    * Fleet-wide gate on opening NEW positions. Returns a reason object when
    * opens should be blocked this cycle, else null. Two independent arms:
-   *   - vol gate: BTC absolute move over any configured window exceeds its
-   *     threshold (a sharp spike or a slow grind);
+   *   - vol gate: BTC move over any configured window exceeds its threshold
+   *     (a sharp spike or a slow grind). A directional rule only blocks the
+   *     side the move hurts, so `side` must be passed to get that narrowing;
    *   - re-entry cooldown: this bot was liquidated within the last
    *     `reentryCooldownMs` (shape-independent — don't re-arm into the storm).
    * Both are off unless configured. Existing positions / TP / closes are never
    * affected — this only suppresses new opens.
    */
-  private shouldBlockOpens(nowMs: number): Record<string, unknown> | null {
+  private shouldBlockOpens(
+    nowMs: number,
+    side?: "YES" | "NO",
+  ): Record<string, unknown> | null {
     if (this.volGate) {
-      const d = this.volGate.evaluate();
-      if (d.block) return { gate: "vol", breaches: d.breaches, moves: d.moves };
+      const d = this.volGate.evaluate(side);
+      if (d.block)
+        return { gate: "vol", side, breaches: d.breaches, moves: d.moves };
     }
     if (this.cfg.reentryCooldownMs && this.state.lastLiquidatedAt !== null) {
       const sinceMs = nowMs - this.state.lastLiquidatedAt;
@@ -699,7 +718,8 @@ export class BucketBot implements Stoppable {
    * each record look up the token's resolution + post-`ts` price path and
    * replay the would-be position (liq at `entryPriceMid × (1 − 0.7/leverage)`,
    * else $1/$0 at resolution) — the same model the bucket backtest uses.
-   * Deduped via `blockLoggedKeys` (cleared on calm cycles) so a slot blocked
+   * Deduped via `blockLoggedKeys` (cleared per side on that side's calm
+   * cycles) so a slot blocked
    * for 60 cycles counts as one prevented open, captured at the price it WOULD
    * have entered.
    */
@@ -751,12 +771,17 @@ export class BucketBot implements Stoppable {
    * positionId), so the `positionId == null` filter never touches them.
    */
   private async cancelRestingOpensOnBlock(
-    gate: Record<string, unknown>,
+    blockBySide: Record<"YES" | "NO", Record<string, unknown> | null>,
   ): Promise<void> {
     if (this.cfg.dryRun) return;
     for (const key of Object.keys(this.state.openByKey)) {
       const slot = this.state.openByKey[key];
       if (!slot || slot.orderId == null || slot.positionId != null) continue;
+      // slotKey is `event|market|outcome` — keep resting orders on a side the
+      // gate is not blocking.
+      const side = key.split("|")[2] === "YES" ? "YES" : "NO";
+      const gate = blockBySide[side];
+      if (!gate) continue;
 
       let live;
       try {

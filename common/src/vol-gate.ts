@@ -32,12 +32,18 @@ export interface PricePoint {
   price: number;
 }
 
-/** One gate rule: block if |move over `windowMs`| exceeds `thresholdPct` %. */
+/** One gate rule: block if |move over `windowMs`| exceeds `thresholdPct` %.
+ *  When `directional`, only the side the move HURTS is blocked — a rise blocks
+ *  NO, a fall blocks YES. */
 export interface VolRule {
   label: string;
   windowMs: number;
   thresholdPct: number;
+  directional?: boolean;
 }
+
+/** The side of a binary market an open would take. */
+export type PositionSide = "YES" | "NO";
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
@@ -67,10 +73,12 @@ export function parseVolRules(spec: string | undefined): VolRule[] {
   for (const raw of spec.split(",")) {
     const tok = raw.trim();
     if (!tok) continue;
-    const m = tok.match(/^(\d+(?:\.\d+)?)\s*([smhd])\s*:\s*(\d+(?:\.\d+)?)$/i);
+    const m = tok.match(
+      /^(\d+(?:\.\d+)?)\s*([smhd])\s*:\s*(\d+(?:\.\d+)?)\s*(?::\s*(dir))?$/i,
+    );
     if (!m)
       throw new Error(
-        `VOL_GATE_RULES token "${tok}" is malformed; expected "<n><s|m|h|d>:<pct>", e.g. "15m:0.8"`,
+        `VOL_GATE_RULES token "${tok}" is malformed; expected "<n><s|m|h|d>:<pct>[:dir]", e.g. "15m:0.8" or "48h:5:dir"`,
       );
     const qty = Number(m[1]);
     const unit = m[2]!.toLowerCase();
@@ -82,7 +90,13 @@ export function parseVolRules(spec: string | undefined): VolRule[] {
       throw new Error(
         `VOL_GATE_RULES: threshold must be in (0,100] ("${tok}")`,
       );
-    rules.push({ label: `${m[1]}${unit}`, windowMs, thresholdPct: pct });
+    const directional = m[4] !== undefined;
+    rules.push({
+      label: `${m[1]}${unit}${directional ? ":dir" : ""}`,
+      windowMs,
+      thresholdPct: pct,
+      ...(directional ? { directional: true } : {}),
+    });
   }
   if (rules.length === 0) return DEFAULT_VOL_RULES;
   return rules;
@@ -116,6 +130,28 @@ export function absMove(buffer: PricePoint[], windowMs: number): number | null {
   return Math.abs(last.price / past - 1);
 }
 
+/**
+ * Signed fractional move over the trailing `windowMs` (positive = BTC rose).
+ * Same warm-up semantics as `absMove`.
+ */
+export function signedMove(
+  buffer: PricePoint[],
+  windowMs: number,
+): number | null {
+  if (buffer.length === 0) return null;
+  const last = buffer[buffer.length - 1]!;
+  const earliest = buffer[0]!;
+  if (last.ts - earliest.ts < windowMs) return null;
+  const past = priceAtOrBefore(buffer, last.ts - windowMs);
+  if (past === null || past <= 0) return null;
+  return last.price / past - 1;
+}
+
+/** True when a signed BTC move works against `side`. */
+export function moveHurts(move: number, side: PositionSide): boolean {
+  return side === "NO" ? move > 0 : move < 0;
+}
+
 export interface GateDecision {
   block: boolean;
   /** Rules whose move exceeded threshold (empty if not blocking). */
@@ -124,22 +160,31 @@ export interface GateDecision {
   moves: Record<string, number | null>;
 }
 
-/** Pure gate evaluation over a price buffer. Blocks if ANY rule breaches. */
+/**
+ * Pure gate evaluation over a price buffer. Blocks if ANY rule breaches.
+ * A directional rule breaches only when the move hurts `side`; with no `side`
+ * it falls back to the absolute test, so a caller that cannot name a side is
+ * never left unprotected.
+ */
 export function evaluateRules(
   buffer: PricePoint[],
   rules: VolRule[],
+  side?: PositionSide,
 ): GateDecision {
   const breaches: GateDecision["breaches"] = [];
   const moves: Record<string, number | null> = {};
   for (const r of rules) {
-    const m = absMove(buffer, r.windowMs);
+    const signed = signedMove(buffer, r.windowMs);
+    const m = signed === null ? null : Math.abs(signed);
     moves[r.label] = m === null ? null : m * 100;
-    if (m !== null && m * 100 > r.thresholdPct)
-      breaches.push({
-        label: r.label,
-        movePct: m * 100,
-        thresholdPct: r.thresholdPct,
-      });
+    if (m === null || m * 100 <= r.thresholdPct) continue;
+    if (r.directional && side !== undefined && !moveHurts(signed!, side))
+      continue;
+    breaches.push({
+      label: r.label,
+      movePct: m * 100,
+      thresholdPct: r.thresholdPct,
+    });
   }
   return { block: breaches.length > 0, breaches, moves };
 }
@@ -215,12 +260,17 @@ export class BtcVolGate {
     }
   }
 
-  /** Current gate decision against the configured rules. */
-  evaluate(): GateDecision {
-    return evaluateRules(this.buffer, this.rules);
+  /** Current gate decision against the configured rules, for one side. */
+  evaluate(side?: PositionSide): GateDecision {
+    return evaluateRules(this.buffer, this.rules, side);
   }
 
   describeRules(): string {
-    return this.rules.map((r) => `${r.label}>${r.thresholdPct}%`).join(" OR ");
+    return this.rules
+      .map(
+        (r) =>
+          `${r.label}>${r.thresholdPct}%${r.directional ? " (hurt side only)" : ""}`,
+      )
+      .join(" OR ");
   }
 }

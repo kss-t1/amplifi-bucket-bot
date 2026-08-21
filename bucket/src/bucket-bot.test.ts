@@ -49,12 +49,15 @@ function makeBotForCancel(opts: {
     ...opts.slots,
   };
   return {
-    cancel: () =>
+    // Both sides blocked unless a case narrows it.
+    cancel: (
+      blockBySide: unknown = { YES: { gate: "vol" }, NO: { gate: "vol" } },
+    ) =>
       (
         bot as unknown as {
           cancelRestingOpensOnBlock: (g: unknown) => Promise<void>;
         }
-      ).cancelRestingOpensOnBlock({ gate: "vol" }),
+      ).cancelRestingOpensOnBlock(blockBySide),
     openByKey: () =>
       (
         bot as unknown as {
@@ -115,6 +118,20 @@ describe("cancelRestingOpensOnBlock", () => {
     await h.cancel();
     expect(h.canceled).toEqual([10]); // cancel was issued
     expect(h.openByKey()["k|m|NO"]?.positionId).toBe(888); // NOT freed
+  });
+
+  it("cancels only the blocked side's resting orders", async () => {
+    const h = makeBotForCancel({
+      getOrder: () => ({ status: "RESTING", sharesFilled: "0" }),
+      slots: {
+        "k|m|NO": { orderId: 10, positionId: null, limitPrice: 0.99 },
+        "k|m|YES": { orderId: 11, positionId: null, limitPrice: 0.02 },
+      },
+    });
+    await h.cancel({ YES: null, NO: { gate: "vol", side: "NO" } });
+    expect(h.canceled).toEqual([10]);
+    expect(h.openByKey()["k|m|NO"]).toBeUndefined();
+    expect(h.openByKey()["k|m|YES"]).toBeDefined();
   });
 
   it("no-ops in dry-run", async () => {
