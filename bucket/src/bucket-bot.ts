@@ -23,6 +23,7 @@ import {
 } from "./allocator.ts";
 import { LendingPoolReader } from "./lending-pool.ts";
 import { BtcVolGate } from "../../common/src/vol-gate.ts";
+import { evaluateHeadroom } from "../../common/src/headroom-gate.ts";
 import {
   emptyStabilityState,
   isStable,
@@ -270,7 +271,14 @@ export class BucketBot implements Stoppable {
           )
         : null;
     this.volGate = cfg.volGateEnabled
-      ? new BtcVolGate(cfg.volRules, cfg.btcVolPollMs, logger)
+      ? new BtcVolGate(
+          cfg.volRules,
+          cfg.btcVolPollMs,
+          logger,
+          Date.now,
+          fetch,
+          cfg.headroomGateEnabled ? 30 * 60 * 60 * 1000 : 0,
+        )
       : null;
   }
 
@@ -596,6 +604,16 @@ export class BucketBot implements Stoppable {
         this.recordBlockedOpen(key, t, gated, now.getTime());
         continue;
       }
+      const room = this.checkHeadroom(t, events, now);
+      if (room?.block) {
+        this.recordBlockedOpen(
+          key,
+          t,
+          { gate: "headroom", ...room },
+          now.getTime(),
+        );
+        continue;
+      }
       if (!this.passesStabilityGate(t, now)) continue;
       if (this.cfg.orderMode === "taker") {
         await this.tryOpenTaker(key, t);
@@ -649,6 +667,36 @@ export class BucketBot implements Stoppable {
 
   /** True when the stability gate is disabled OR the bot has observed this
    *  target's bucket continuously for the configured window. */
+  /** Headroom gate — see `common/src/headroom-gate.ts`. Needs the vol gate's
+   *  price feed, so it is inert when that is off. */
+  private checkHeadroom(
+    t: AllocationTarget,
+    events: ReadonlyArray<BtcDailyEvent | null>,
+    now: Date,
+  ): Record<string, unknown> | null {
+    if (!this.cfg.headroomGateEnabled || !this.volGate) return null;
+    const end = events[t.dayIndex]?.endDate;
+    if (end === undefined) return null;
+    const hours = Math.max(
+      0,
+      (new Date(end).getTime() - now.getTime()) / 3_600_000,
+    );
+    const d = evaluateHeadroom(
+      [...this.volGate.prices()],
+      t.strikeUsd,
+      t.outcome,
+      hours,
+      { k: this.cfg.headroomK, timeExponent: this.cfg.headroomTimeExponent },
+    );
+    return {
+      block: d.block,
+      headroomPct: d.headroomPct,
+      requiredPct: d.requiredPct,
+      hourlyVolPct: d.hourlyVolPct,
+      hoursToResolution: d.hoursToResolution,
+    };
+  }
+
   private passesStabilityGate(t: AllocationTarget, now: Date): boolean {
     const windowMin = this.cfg.bucketStabilityWindowMin;
     if (windowMin === undefined) return true;

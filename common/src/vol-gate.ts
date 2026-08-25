@@ -207,9 +207,17 @@ export class BtcVolGate {
     private readonly logger: VolLogger,
     private readonly now: () => number = Date.now,
     private readonly fetchImpl: typeof fetch = fetch,
+    /** Floor on buffer retention. The headroom gate reads 24h of hourly
+     *  returns off this same buffer, which a short rule set would not keep. */
+    minKeepMs = 0,
   ) {
     const maxWindow = rules.reduce((mx, r) => Math.max(mx, r.windowMs), 0);
-    this.keepMs = Math.max(maxWindow * 1.25, 30 * MIN);
+    this.keepMs = Math.max(maxWindow * 1.25, 30 * MIN, minKeepMs);
+  }
+
+  /** Price history backing the rules, for gates that need the same spot feed. */
+  prices(): readonly PricePoint[] {
+    return this.buffer;
   }
 
   /** Seed the buffer from 5m klines so long-window rules are warm immediately. */

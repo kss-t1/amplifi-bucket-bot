@@ -5,6 +5,7 @@ import {
   resolveLiveStrikePrices,
 } from "./bucket-bot.ts";
 import type { BtcDailyEvent, BtcDailyStrike } from "./btc-daily.ts";
+import type { PricePoint } from "../../common/src/vol-gate.ts";
 
 const noopLogger = { info() {}, warn() {}, error() {} } as never;
 
@@ -297,5 +298,95 @@ describe("resolveLiveStrikePrices", () => {
     );
     expect(result.droppedStrikes).toBe(1);
     expect(result.events[0]?.strikes).toHaveLength(0);
+  });
+});
+
+/** Build a bot whose vol gate serves a fixed price history, and expose the
+ *  private headroom check. The walk must not repeat hourly or every hourly
+ *  return is zero and the fixture measures no volatility at all. */
+function makeBotForHeadroom(opts: {
+  enabled: boolean;
+  k?: number;
+  timeExponent?: number;
+}) {
+  const MIN = 60_000;
+  const END = 100_000_000;
+  const prices: PricePoint[] = [];
+  let x = 100;
+  for (let i = 399; i >= 0; i--) {
+    const r = Math.sin((399 - i) * 12.9898) * 43758.5453;
+    x *= 1 + (r - Math.floor(r) - 0.5) * 0.004;
+    prices.push({ ts: END - i * 5 * MIN, price: x });
+  }
+  const cfg = {
+    stateFile: "/tmp/bucket-headroom-test.json",
+    dryRun: true,
+    headroomGateEnabled: opts.enabled,
+    headroomK: opts.k ?? 7,
+    headroomTimeExponent: opts.timeExponent ?? 0,
+  } as never;
+  const bot = new BucketBot(cfg, {} as never, {} as never, noopLogger);
+  (bot as unknown as { volGate: unknown }).volGate = {
+    prices: () => prices,
+  };
+  const spot = prices[prices.length - 1]!.price;
+  return {
+    spot,
+    check: (
+      strikeUsd: number,
+      outcome: "YES" | "NO",
+      endMs: number,
+      events?: unknown,
+    ) =>
+      (
+        bot as unknown as {
+          checkHeadroom: (
+            t: unknown,
+            events: unknown,
+            now: Date,
+          ) => Record<string, unknown> | null;
+        }
+      ).checkHeadroom(
+        { strikeUsd, outcome, dayIndex: 0 },
+        events ?? [{ endDate: new Date(endMs).toISOString() }],
+        new Date(END),
+      ),
+  };
+}
+
+describe("checkHeadroom", () => {
+  const SIX_HOURS = 6 * 3_600_000;
+
+  it("is inert when the gate is disabled", () => {
+    const h = makeBotForHeadroom({ enabled: false });
+    expect(h.check(h.spot + 0.1, "NO", 100_000_000 + SIX_HOURS)).toBeNull();
+  });
+
+  it("blocks a strike sitting inside the required cushion", () => {
+    const h = makeBotForHeadroom({ enabled: true });
+    const d = h.check(h.spot * 1.002, "NO", 100_000_000 + SIX_HOURS)!;
+    expect(d.block).toBe(true);
+    expect(d.gate).toBeUndefined();
+    expect(d.hoursToResolution).toBeCloseTo(6, 3);
+  });
+
+  it("allows a strike well outside it", () => {
+    const h = makeBotForHeadroom({ enabled: true });
+    expect(h.check(h.spot * 2, "NO", 100_000_000 + SIX_HOURS)!.block).toBe(
+      false,
+    );
+  });
+
+  it("derives hours-to-resolution from the day's event", () => {
+    const h = makeBotForHeadroom({ enabled: true });
+    const d = h.check(h.spot * 2, "NO", 100_000_000 + 18 * 3_600_000)!;
+    expect(d.hoursToResolution).toBeCloseTo(18, 3);
+  });
+
+  it("returns null when the day has no event", () => {
+    const h = makeBotForHeadroom({ enabled: true });
+    const strike = h.spot * 1.002; // would otherwise block
+    expect(h.check(strike, "NO", 0, [null])).toBeNull();
+    expect(h.check(strike, "NO", 0, [])).toBeNull();
   });
 });
