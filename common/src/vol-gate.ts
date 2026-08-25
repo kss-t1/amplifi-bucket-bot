@@ -234,9 +234,17 @@ export class BtcVolGate {
       // time (r[0]) — otherwise every seeded point is mislabeled by one
       // interval, skewing short-window (e.g. 15m) moves until live spot polls
       // replace the seed.
+      // Binance returns the still-OPEN candle last, and its close time is in
+      // the future. Keeping it leaves the buffer non-monotonic as soon as
+      // `poll()` appends a point stamped now, which breaks every reader that
+      // walks it in time order.
+      const cutoff = this.now();
       this.buffer = rows
         .map((r) => ({ ts: Number(r[6]), price: Number(r[4]) }))
-        .filter((p) => Number.isFinite(p.ts) && Number.isFinite(p.price))
+        .filter(
+          (p) =>
+            Number.isFinite(p.ts) && Number.isFinite(p.price) && p.ts <= cutoff,
+        )
         .sort((a, b) => a.ts - b.ts);
       this.logger.info("vol-gate seeded", {
         rules: this.rules.map((r) => `${r.label}:${r.thresholdPct}%`).join(","),
