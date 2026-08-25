@@ -136,6 +136,12 @@ interface OpenSlot {
   bucket: string;
   leverage: number;
   collateralUsd: number;
+  /** Strike and event resolution captured at placement. The live-price overlay
+   *  drops strikes whose book has gone one-sided, so a resting order's strike
+   *  can vanish from `events` while the order is still live; the headroom sweep
+   *  needs it to re-check that order at all. Optional: slots persisted before
+   *  this existed simply fall back to the `events` lookup. */
+  strikeUsd?: number;
   /** Maker limit price (best-bid at place time, rounded down to tick). */
   limitPrice: number;
   /** Tick size we used; needed for reprice escalation. */
@@ -475,6 +481,32 @@ export class BucketBot implements Stoppable {
     // capital so the planning log stays meaningful. Live-mode fetch failure
     // skips ONLY the new-order placement (return below) — reconcile already
     // ran, so fills / reprices / resolutions are still processed and saved.
+    // Gate on opening NEW positions (vol gate + re-entry cooldown). A
+    // directional vol rule blocks only the side the BTC move hurts, so
+    // evaluate once per side; existing positions, TP, and closes are
+    // unaffected.
+    const blockBySide: Record<"YES" | "NO", Record<string, unknown> | null> = {
+      YES: this.shouldBlockOpens(now.getTime(), "YES"),
+      NO: this.shouldBlockOpens(now.getTime(), "NO"),
+    };
+    // Blocking new opens is not enough: a resting maker BUY placed in a calm
+    // cycle still sits in the book and FILLS if the spike sweeps through it,
+    // re-arming the very directional exposure the gate exists to prevent
+    // (observed live on vm018 2026-06-29 — calm-placed 0.99+ NO orders filled
+    // mid-spike while the gate correctly blocked fresh opens). Filled slots
+    // (positionId set) keep riding to resolution untouched.
+    //
+    // Both sweeps run BEFORE the balance fetch below, because that fetch
+    // returns early when it fails and a flaky cycle is exactly when leaving
+    // gate-blocked orders resting in the book is most expensive.
+    // slotKey is `event|market|outcome`, so the side is readable off the key.
+    if (blockBySide.YES ?? blockBySide.NO)
+      await this.cancelRestingOpens(
+        (key) => blockBySide[key.split("|")[2] === "YES" ? "YES" : "NO"],
+      );
+    if (this.cfg.headroomGateEnabled)
+      await this.cancelRestingOpens(this.headroomCancelReason(events, now));
+
     let capitalUsd: number;
     if (this.cfg.dryRun) {
       capitalUsd = this.cfg.totalCapitalUsd;
@@ -569,10 +601,6 @@ export class BucketBot implements Stoppable {
     // directional vol rule blocks only the side the BTC move hurts, so
     // evaluate once per side; existing positions, TP, and closes are
     // unaffected.
-    const blockBySide: Record<"YES" | "NO", Record<string, unknown> | null> = {
-      YES: this.shouldBlockOpens(now.getTime(), "YES"),
-      NO: this.shouldBlockOpens(now.getTime(), "NO"),
-    };
     const anyBlock = blockBySide.YES ?? blockBySide.NO;
     if (anyBlock && targets.length > 0)
       this.logger.info("skip opens — gate", {
@@ -594,15 +622,6 @@ export class BucketBot implements Stoppable {
     // mid-spike while the gate correctly blocked fresh opens). So whenever
     // opens are gated, also CANCEL the bot's own still-resting, zero-fill open
     // orders. Filled slots (positionId set) keep riding to resolution untouched.
-    // slotKey is `event|market|outcome`, so the side is readable off the key.
-    if (anyBlock)
-      await this.cancelRestingOpens(
-        (key) => blockBySide[key.split("|")[2] === "YES" ? "YES" : "NO"],
-      );
-
-    if (this.cfg.headroomGateEnabled)
-      await this.cancelRestingOpens(this.headroomCancelReason(events, now));
-
     for (const t of targets) {
       const key = slotKey(t.eventSlug, t.marketSlug, t.outcome);
       if (this.state.openByKey[key]) continue;
@@ -681,7 +700,14 @@ export class BucketBot implements Stoppable {
     events: ReadonlyArray<BtcDailyEvent | null>,
     now: Date,
   ): Record<string, unknown> | null {
-    return this.checkHeadroomFor(t.marketSlug, t.outcome, events, now);
+    return this.checkHeadroomFor(
+      t.marketSlug,
+      t.outcome,
+      events,
+      now,
+      t.strikeUsd,
+      t.eventSlug,
+    );
   }
 
   /** Cancel-predicate for resting orders whose cushion has since gone. A maker
@@ -697,6 +723,8 @@ export class BucketBot implements Stoppable {
         slot.outcome,
         events,
         now,
+        slot.strikeUsd,
+        slot.eventSlug,
       );
       return room?.block ? { gate: "headroom", ...room } : null;
     };
@@ -709,15 +737,19 @@ export class BucketBot implements Stoppable {
     outcome: "YES" | "NO",
     events: ReadonlyArray<BtcDailyEvent | null>,
     now: Date,
+    knownStrikeUsd?: number,
+    eventSlug?: string,
   ): Record<string, unknown> | null {
     if (!this.cfg.headroomGateEnabled || !this.volGate) return null;
-    let strikeUsd: number | undefined;
+    let strikeUsd = knownStrikeUsd;
     let end: string | undefined;
     for (const ev of events) {
-      const hit = ev?.strikes.find((s) => s.slug === marketSlug);
+      if (!ev) continue;
+      if (eventSlug !== undefined && ev.slug === eventSlug) end = ev.endDate;
+      const hit = ev.strikes.find((x) => x.slug === marketSlug);
       if (hit) {
-        strikeUsd = hit.strikeUsd;
-        end = ev!.endDate;
+        strikeUsd ??= hit.strikeUsd;
+        end ??= ev.endDate;
         break;
       }
     }
@@ -1827,6 +1859,7 @@ export class BucketBot implements Stoppable {
         tokenId: canonicalYesTokenId,
         outcome: t.outcome,
         bucket: t.bucket,
+        strikeUsd: t.strikeUsd,
         leverage,
         collateralUsd: collateral,
         limitPrice,
@@ -1862,6 +1895,7 @@ export class BucketBot implements Stoppable {
         tokenId: canonicalYesTokenId,
         outcome: t.outcome,
         bucket: t.bucket,
+        strikeUsd: t.strikeUsd,
         leverage,
         collateralUsd: collateral,
         limitPrice,
@@ -2039,6 +2073,7 @@ export class BucketBot implements Stoppable {
         tokenId: canonicalYesTokenId,
         outcome: t.outcome,
         bucket: t.bucket,
+        strikeUsd: t.strikeUsd,
         leverage,
         collateralUsd: collateral,
         limitPrice: t.entryPriceMid,
@@ -2082,6 +2117,7 @@ export class BucketBot implements Stoppable {
         tokenId: canonicalYesTokenId,
         outcome: t.outcome,
         bucket: t.bucket,
+        strikeUsd: t.strikeUsd,
         leverage,
         collateralUsd: collateral,
         limitPrice: haveEntry ? entryPrice : t.entryPriceMid,

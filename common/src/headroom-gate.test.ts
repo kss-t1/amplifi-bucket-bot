@@ -55,6 +55,25 @@ describe("hourlyVol", () => {
   it("is positive on a moving tape", () => {
     expect(hourlyVol(choppy)!).toBeGreaterThan(0);
   });
+  it("ignores lookbacks that land far off one hour, so a gap cannot fake calm", () => {
+    // One old anchor, a 6h hole, then 13 samples inside the following hour and
+    // 30% higher. Every one of them looks back past the hole to that same
+    // anchor, so unbounded their returns are near-identical: stdev collapses
+    // and a 30% jump reads as dead calm. Bounded, none of them qualify at all.
+    const gapped: PricePoint[] = [{ ts: END, price: 100 }];
+    for (let i = 0; i < 13; i++)
+      gapped.push({
+        ts: END + 6 * HOUR + i * 4 * MIN,
+        price: 130 * (1 + i * 0.0001),
+      });
+
+    const unbounded = hourlyVol(gapped, 24 * HOUR, 12, Number.MAX_SAFE_INTEGER);
+    expect(unbounded).not.toBeNull();
+    expect(unbounded!).toBeLessThan(1e-3); // a 30% move measured as ~zero vol
+
+    expect(hourlyVol(gapped)).toBeNull(); // bounded: refuses to measure
+  });
+
   it("returns null before enough history accumulates", () => {
     expect(hourlyVol(buf(3, () => 100))).toBeNull();
     expect(hourlyVol([])).toBeNull();

@@ -34,6 +34,12 @@ export function hourlyVol(
   buffer: PricePoint[],
   windowMs = 24 * HOUR,
   minSamples = 12,
+  /** How far off a one-hour lookback may land. A poll outage leaves a gap, and
+   *  an unbounded lookback would then measure several samples against the SAME
+   *  pre-gap price: those returns are near-identical, so their stdev collapses
+   *  toward zero and the gate stops requiring any cushion at exactly the moment
+   *  a large move went unobserved. */
+  maxLookbackSkewMs = 10 * MIN,
 ): number | null {
   if (buffer.length < 2) return null;
   const last = buffer[buffer.length - 1]!;
@@ -41,9 +47,11 @@ export function hourlyVol(
   const rets: number[] = [];
   for (const p of buffer) {
     if (p.ts < from) continue;
-    const prior = priceAt(buffer, p.ts - HOUR);
-    if (prior === null || prior <= 0 || p.price <= 0) continue;
-    rets.push(Math.log(p.price / prior));
+    const want = p.ts - HOUR;
+    const prior = priceAt(buffer, want);
+    if (prior === null || prior.price <= 0 || p.price <= 0) continue;
+    if (want - prior.ts > maxLookbackSkewMs) continue;
+    rets.push(Math.log(p.price / prior.price));
   }
   if (rets.length < minSamples) return null;
   const mu = rets.reduce((a, b) => a + b, 0) / rets.length;
@@ -52,10 +60,10 @@ export function hourlyVol(
   return Math.sqrt(varr);
 }
 
-function priceAt(buffer: PricePoint[], ts: number): number | null {
-  let found: number | null = null;
+function priceAt(buffer: PricePoint[], ts: number): PricePoint | null {
+  let found: PricePoint | null = null;
   for (const p of buffer) {
-    if (p.ts <= ts) found = p.price;
+    if (p.ts <= ts) found = p;
     else break;
   }
   return found;
