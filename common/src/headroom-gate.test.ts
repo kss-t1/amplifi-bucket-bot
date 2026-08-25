@@ -3,7 +3,7 @@ import {
   evaluateHeadroom,
   headroomFraction,
   hourlyVol,
-  type PositionSide,
+  measure,
 } from "./headroom-gate.ts";
 import type { PricePoint } from "./vol-gate.ts";
 
@@ -86,59 +86,55 @@ describe("evaluateHeadroom", () => {
   it("blocks a strike sitting inside the required cushion", () => {
     // the walk ends near 101.8; a NO strike at 102 is ~0.2% away, well inside
     // the 7 x 0.32% hourly vol this fixture measures
-    const d = evaluateHeadroom(choppy, 102, "NO", 6, CFG);
+    const d = evaluateHeadroom(measure(choppy), 102, "NO", 6, CFG);
     expect(d.block).toBe(true);
     expect(d.headroomPct!).toBeLessThan(d.requiredPct!);
   });
 
   it("allows a strike far outside the cushion", () => {
-    const d = evaluateHeadroom(choppy, 200, "NO", 6, CFG);
+    const d = evaluateHeadroom(measure(choppy), 200, "NO", 6, CFG);
     expect(d.block).toBe(false);
   });
 
   it("fails open when volatility cannot be measured", () => {
-    const d = evaluateHeadroom(
-      buf(3, () => 100),
-      102,
-      "NO",
-      6,
-      CFG,
-    );
+    const d = evaluateHeadroom(measure(buf(3, () => 100)), 102, "NO", 6, CFG);
     expect(d.block).toBe(false);
     expect(d.requiredPct).toBeNull();
   });
 
   it("fails open on an empty buffer", () => {
-    expect(evaluateHeadroom([], 100, "NO", 6, CFG).block).toBe(false);
+    expect(evaluateHeadroom(measure([]), 100, "NO", 6, CFG).block).toBe(false);
   });
 
   it("blocks a position already the wrong side of the strike", () => {
     // spot is the last choppy price; a YES strike ABOVE it has negative headroom
     const spot = choppy[choppy.length - 1]!.price;
-    expect(evaluateHeadroom(choppy, spot + 10, "YES", 6, CFG).block).toBe(true);
+    expect(
+      evaluateHeadroom(measure(choppy), spot + 10, "YES", 6, CFG).block,
+    ).toBe(true);
   });
 
   it("with timeExponent 0, hours-to-resolution does not change the verdict", () => {
-    const near = evaluateHeadroom(choppy, 103, "NO", 1, CFG);
-    const far = evaluateHeadroom(choppy, 103, "NO", 24, CFG);
+    const near = evaluateHeadroom(measure(choppy), 103, "NO", 1, CFG);
+    const far = evaluateHeadroom(measure(choppy), 103, "NO", 24, CFG);
     expect(near.requiredPct).toBeCloseTo(far.requiredPct!, 9);
     expect(near.block).toBe(far.block);
   });
 
   it("with timeExponent 0.5, a longer horizon demands more headroom", () => {
     const cfg = { k: 7, timeExponent: 0.5 };
-    const near = evaluateHeadroom(choppy, 103, "NO", 1, cfg);
-    const far = evaluateHeadroom(choppy, 103, "NO", 24, cfg);
+    const near = evaluateHeadroom(measure(choppy), 103, "NO", 1, cfg);
+    const far = evaluateHeadroom(measure(choppy), 103, "NO", 24, cfg);
     expect(far.requiredPct!).toBeGreaterThan(near.requiredPct!);
     expect(far.requiredPct!).toBeCloseTo(near.requiredPct! * Math.sqrt(24), 6);
   });
 
   it("a bigger k demands more headroom", () => {
-    const lo = evaluateHeadroom(choppy, 103, "NO", 6, {
+    const lo = evaluateHeadroom(measure(choppy), 103, "NO", 6, {
       k: 2,
       timeExponent: 0,
     });
-    const hi = evaluateHeadroom(choppy, 103, "NO", 6, {
+    const hi = evaluateHeadroom(measure(choppy), 103, "NO", 6, {
       k: 14,
       timeExponent: 0,
     });
@@ -146,13 +142,13 @@ describe("evaluateHeadroom", () => {
   });
 
   it("still evaluates with an unknown horizon while timeExponent is 0", () => {
-    const d = evaluateHeadroom(choppy, 102, "NO", null, CFG);
+    const d = evaluateHeadroom(measure(choppy), 102, "NO", null, CFG);
     expect(d.block).toBe(true);
     expect(d.hoursToResolution).toBeNull();
   });
 
   it("fails open on an unknown horizon once the requirement scales with it", () => {
-    const d = evaluateHeadroom(choppy, 102, "NO", null, {
+    const d = evaluateHeadroom(measure(choppy), 102, "NO", null, {
       k: 7,
       timeExponent: 0.5,
     });
@@ -161,7 +157,7 @@ describe("evaluateHeadroom", () => {
   });
 
   it("reports the measurement even when it does not block", () => {
-    const d = evaluateHeadroom(choppy, 200, "NO", 6, CFG);
+    const d = evaluateHeadroom(measure(choppy), 200, "NO", 6, CFG);
     expect(d.block).toBe(false);
     expect(d.headroomPct!).toBeGreaterThan(0);
     expect(d.hourlyVolPct!).toBeGreaterThan(0);

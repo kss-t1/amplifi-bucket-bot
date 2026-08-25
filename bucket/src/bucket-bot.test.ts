@@ -6,6 +6,7 @@ import {
 } from "./bucket-bot.ts";
 import type { BtcDailyEvent, BtcDailyStrike } from "./btc-daily.ts";
 import type { PricePoint } from "../../common/src/vol-gate.ts";
+import { measure } from "../../common/src/headroom-gate.ts";
 
 const noopLogger = { info() {}, warn() {}, error() {} } as never;
 
@@ -348,11 +349,20 @@ function makeBotForHeadroom(opts: {
             outcome: "YES" | "NO",
             events: unknown,
             now: Date,
+            vol: unknown,
             knownStrikeUsd?: number,
             eventSlug?: string,
           ) => Record<string, unknown> | null;
         }
-      ).checkHeadroomFor("gone", outcome, [], new Date(END), strikeUsd, "gone"),
+      ).checkHeadroomFor(
+        "gone",
+        outcome,
+        [],
+        new Date(END),
+        measure(prices),
+        strikeUsd,
+        "gone",
+      ),
     check: (
       strikeUsd: number,
       outcome: "YES" | "NO",
@@ -365,6 +375,7 @@ function makeBotForHeadroom(opts: {
             t: unknown,
             events: unknown,
             now: Date,
+            vol: unknown,
           ) => Record<string, unknown> | null;
         }
       ).checkHeadroom(
@@ -376,6 +387,7 @@ function makeBotForHeadroom(opts: {
           },
         ],
         new Date(END),
+        measure(prices),
       ),
   };
 }
@@ -512,14 +524,18 @@ describe("headroom cancels resting orders whose cushion has gone", () => {
         (
           bot as unknown as {
             cancelRestingOpens: (f: unknown) => Promise<void>;
-            headroomCancelReason: (e: unknown, n: Date) => unknown;
+            headroomCancelReason: (e: unknown, n: Date, v: unknown) => unknown;
           }
         ).cancelRestingOpens(
           (
             bot as unknown as {
-              headroomCancelReason: (e: unknown, n: Date) => unknown;
+              headroomCancelReason: (
+                e: unknown,
+                n: Date,
+                v: unknown,
+              ) => unknown;
             }
-          ).headroomCancelReason(events, new Date(END)),
+          ).headroomCancelReason(events, new Date(END), measure(prices)),
         ),
     };
   }

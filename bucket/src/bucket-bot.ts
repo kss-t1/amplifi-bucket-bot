@@ -23,7 +23,11 @@ import {
 } from "./allocator.ts";
 import { LendingPoolReader } from "./lending-pool.ts";
 import { BtcVolGate } from "../../common/src/vol-gate.ts";
-import { evaluateHeadroom } from "../../common/src/headroom-gate.ts";
+import {
+  evaluateHeadroom,
+  measure,
+  type VolMeasurement,
+} from "../../common/src/headroom-gate.ts";
 import {
   emptyStabilityState,
   isStable,
@@ -504,8 +508,15 @@ export class BucketBot implements Stoppable {
       await this.cancelRestingOpens(
         (key) => blockBySide[key.split("|")[2] === "YES" ? "YES" : "NO"],
       );
+    // Measured once per cycle: every target and every resting slot reuses it.
+    const vol: VolMeasurement =
+      this.cfg.headroomGateEnabled && this.volGate
+        ? measure(this.volGate.prices())
+        : { spot: null, hourlyVol: null };
     if (this.cfg.headroomGateEnabled)
-      await this.cancelRestingOpens(this.headroomCancelReason(events, now));
+      await this.cancelRestingOpens(
+        this.headroomCancelReason(events, now, vol),
+      );
 
     let capitalUsd: number;
     if (this.cfg.dryRun) {
@@ -630,7 +641,7 @@ export class BucketBot implements Stoppable {
         this.recordBlockedOpen(key, t, gated, now.getTime());
         continue;
       }
-      const room = this.checkHeadroom(t, events, now);
+      const room = this.checkHeadroom(t, events, now, vol);
       if (room?.block) {
         this.recordBlockedOpen(
           key,
@@ -699,12 +710,14 @@ export class BucketBot implements Stoppable {
     t: AllocationTarget,
     events: ReadonlyArray<BtcDailyEvent | null>,
     now: Date,
+    vol: VolMeasurement,
   ): Record<string, unknown> | null {
     return this.checkHeadroomFor(
       t.marketSlug,
       t.outcome,
       events,
       now,
+      vol,
       t.strikeUsd,
       t.eventSlug,
     );
@@ -716,6 +729,7 @@ export class BucketBot implements Stoppable {
   private headroomCancelReason(
     events: ReadonlyArray<BtcDailyEvent | null>,
     now: Date,
+    vol: VolMeasurement,
   ): (key: string, slot: OpenSlot) => Record<string, unknown> | null {
     return (_key, slot) => {
       const room = this.checkHeadroomFor(
@@ -723,6 +737,7 @@ export class BucketBot implements Stoppable {
         slot.outcome,
         events,
         now,
+        vol,
         slot.strikeUsd,
         slot.eventSlug,
       );
@@ -737,6 +752,7 @@ export class BucketBot implements Stoppable {
     outcome: "YES" | "NO",
     events: ReadonlyArray<BtcDailyEvent | null>,
     now: Date,
+    vol: VolMeasurement,
     knownStrikeUsd?: number,
     eventSlug?: string,
   ): Record<string, unknown> | null {
@@ -762,13 +778,10 @@ export class BucketBot implements Stoppable {
       end === undefined
         ? null
         : Math.max(0, (new Date(end).getTime() - now.getTime()) / 3_600_000);
-    const d = evaluateHeadroom(
-      this.volGate.prices(),
-      strikeUsd,
-      outcome,
-      hours,
-      { k: this.cfg.headroomK, timeExponent: this.cfg.headroomTimeExponent },
-    );
+    const d = evaluateHeadroom(vol, strikeUsd, outcome, hours, {
+      k: this.cfg.headroomK,
+      timeExponent: this.cfg.headroomTimeExponent,
+    });
     return {
       block: d.block,
       headroomPct: d.headroomPct,

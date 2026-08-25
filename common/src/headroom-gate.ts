@@ -45,11 +45,16 @@ export function hourlyVol(
   const last = buffer[buffer.length - 1]!;
   const from = last.ts - windowMs;
   const rets: number[] = [];
+  // `want` only increases, so the lookback index never rewinds: one pass, not a
+  // rescan per point. At 20s polls a 60h buffer holds ~10,800 points and the
+  // quadratic form ran per target, per cycle.
+  let j = 0;
   for (const p of buffer) {
     if (p.ts < from) continue;
     const want = p.ts - HOUR;
-    const prior = priceAt(buffer, want);
-    if (prior === null || prior.price <= 0 || p.price <= 0) continue;
+    while (j + 1 < buffer.length && buffer[j + 1]!.ts <= want) j++;
+    const prior = buffer[j]!;
+    if (prior.ts > want || prior.price <= 0 || p.price <= 0) continue;
     if (want - prior.ts > maxLookbackSkewMs) continue;
     rets.push(Math.log(p.price / prior.price));
   }
@@ -58,15 +63,6 @@ export function hourlyVol(
   const varr =
     rets.reduce((a, b) => a + (b - mu) * (b - mu), 0) / (rets.length - 1);
   return Math.sqrt(varr);
-}
-
-function priceAt(buffer: PricePoint[], ts: number): PricePoint | null {
-  let found: PricePoint | null = null;
-  for (const p of buffer) {
-    if (p.ts <= ts) found = p;
-    else break;
-  }
-  return found;
 }
 
 /**
@@ -100,15 +96,27 @@ export interface HeadroomDecision {
   hoursToResolution: number | null;
 }
 
+/** Spot and realized vol, measured once per cycle and reused across targets. */
+export interface VolMeasurement {
+  spot: number | null;
+  hourlyVol: number | null;
+}
+
+export function measure(buffer: PricePoint[]): VolMeasurement {
+  return {
+    spot: buffer.length > 0 ? buffer[buffer.length - 1]!.price : null,
+    hourlyVol: hourlyVol(buffer),
+  };
+}
+
 export function evaluateHeadroom(
-  buffer: PricePoint[],
+  m: VolMeasurement,
   strikeUsd: number,
   side: PositionSide,
   hoursToResolution: number | null,
   cfg: HeadroomConfig,
 ): HeadroomDecision {
-  const spot = buffer.length > 0 ? buffer[buffer.length - 1]!.price : null;
-  const vol = hourlyVol(buffer);
+  const { spot, hourlyVol: vol } = m;
   const head = spot === null ? null : headroomFraction(spot, strikeUsd, side);
   const base = {
     headroomPct: head === null ? null : head * 100,
