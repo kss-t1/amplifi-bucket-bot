@@ -69,7 +69,14 @@ describe("hourlyVol", () => {
         price: 130 * (1 + i * 0.0001),
       });
 
-    const unbounded = hourlyVol(gapped, 24 * HOUR, 12, Number.MAX_SAFE_INTEGER);
+    // coverage relaxed too, so this isolates the lookback bound alone
+    const unbounded = hourlyVol(
+      gapped,
+      24 * HOUR,
+      12,
+      Number.MAX_SAFE_INTEGER,
+      0,
+    );
     expect(unbounded).not.toBeNull();
     expect(unbounded!).toBeLessThan(1e-3); // a 30% move measured as ~zero vol
 
@@ -92,6 +99,20 @@ describe("hourlyVol", () => {
 
     // Measured: 0.0219 resampled, 0.0143 without — a 35% understatement.
     expect(hourlyVol(pts)!).toBeGreaterThan(0.018);
+  });
+
+  it("refuses to call one fresh hour a day, after a long blackout", () => {
+    // The bot stayed up through a 30h outage, so no reseed happened; an hour of
+    // post-outage polls is enough samples but nowhere near enough of the window.
+    const pts: PricePoint[] = [];
+    for (let i = 0; i < 12; i++)
+      pts.push({ ts: END - 30 * HOUR + i * 5 * MIN, price: 100 });
+    // just over two hours back, so the later points have valid in-hour lookbacks
+    for (let i = 0; i < 26; i++)
+      pts.push({ ts: END - 2 * HOUR + i * 5 * MIN, price: 100 + i * 0.01 });
+    expect(hourlyVol(pts)).toBeNull();
+    // the same samples pass once the coverage requirement is lifted
+    expect(hourlyVol(pts, 24 * HOUR, 12, 10 * MIN, 0)).not.toBeNull();
   });
 
   it("returns null before enough history accumulates", () => {

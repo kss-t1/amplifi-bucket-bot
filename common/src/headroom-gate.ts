@@ -42,6 +42,13 @@ export function hourlyVol(
    *  toward zero and the gate stops requiring any cushion at exactly the moment
    *  a large move went unobserved. */
   maxLookbackSkewMs = 10 * MIN,
+  /** Fraction of `windowMs` the accepted returns must actually span. A mid-run
+   *  feed outage leaves a hole the lookback bound already refuses to measure
+   *  across, so once an hour of fresh data accumulates there are 12 samples
+   *  again — all from that one hour. Without this, a calm hour after a long
+   *  blackout would be reported as a calm day. A fresh `seed()` covers the
+   *  whole window from klines, so this never bites at startup. */
+  minCoverage = 0.5,
 ): number | null {
   if (buffer.length < 2) return null;
   // Resample to one point per 5 minutes first. The buffer mixes 5-minute seed
@@ -62,6 +69,8 @@ export function hourlyVol(
   const last = grid[grid.length - 1]!;
   const from = last.ts - windowMs;
   const rets: number[] = [];
+  let spanStart = 0;
+  let spanEnd = 0;
   // `want` only increases, so the lookback index never rewinds: one pass, not a
   // rescan per point.
   let j = 0;
@@ -72,9 +81,12 @@ export function hourlyVol(
     const prior = grid[j]!;
     if (prior.ts > want || prior.price <= 0) continue;
     if (want - prior.ts > maxLookbackSkewMs) continue;
+    if (rets.length === 0) spanStart = p.ts;
+    spanEnd = p.ts;
     rets.push(Math.log(p.price / prior.price));
   }
   if (rets.length < minSamples) return null;
+  if (spanEnd - spanStart < windowMs * minCoverage) return null;
   const mu = rets.reduce((a, b) => a + b, 0) / rets.length;
   const varr =
     rets.reduce((a, b) => a + (b - mu) * (b - mu), 0) / (rets.length - 1);
