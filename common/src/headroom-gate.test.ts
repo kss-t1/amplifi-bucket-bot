@@ -145,6 +145,21 @@ describe("evaluateHeadroom", () => {
     expect(hi.requiredPct!).toBeCloseTo(lo.requiredPct! * 7, 6);
   });
 
+  it("still evaluates with an unknown horizon while timeExponent is 0", () => {
+    const d = evaluateHeadroom(choppy, 102, "NO", null, CFG);
+    expect(d.block).toBe(true);
+    expect(d.hoursToResolution).toBeNull();
+  });
+
+  it("fails open on an unknown horizon once the requirement scales with it", () => {
+    const d = evaluateHeadroom(choppy, 102, "NO", null, {
+      k: 7,
+      timeExponent: 0.5,
+    });
+    expect(d.block).toBe(false);
+    expect(d.requiredPct).toBeNull();
+  });
+
   it("reports the measurement even when it does not block", () => {
     const d = evaluateHeadroom(choppy, 200, "NO", 6, CFG);
     expect(d.block).toBe(false);

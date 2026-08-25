@@ -340,6 +340,19 @@ function makeBotForHeadroom(opts: {
   const spot = prices[prices.length - 1]!.price;
   return {
     spot,
+    checkKnown: (strikeUsd: number, outcome: "YES" | "NO") =>
+      (
+        bot as unknown as {
+          checkHeadroomFor: (
+            marketSlug: string,
+            outcome: "YES" | "NO",
+            events: unknown,
+            now: Date,
+            knownStrikeUsd?: number,
+            eventSlug?: string,
+          ) => Record<string, unknown> | null;
+        }
+      ).checkHeadroomFor("gone", outcome, [], new Date(END), strikeUsd, "gone"),
     check: (
       strikeUsd: number,
       outcome: "YES" | "NO",
@@ -401,6 +414,13 @@ describe("checkHeadroom", () => {
     const strike = h.spot * 1.002; // would otherwise block
     expect(h.check(strike, "NO", 0, [null])).toBeNull();
     expect(h.check(strike, "NO", 0, [])).toBeNull();
+  });
+
+  it("checks a slot whose event is gone, using the strike it carries", () => {
+    const bot = makeBotForHeadroom({ enabled: true });
+    const res = bot.checkKnown(bot.spot * 1.002, "NO");
+    expect(res!.block).toBe(true);
+    expect(res!.hoursToResolution).toBeNull();
   });
 
   it("returns null when no event lists that market slug", () => {

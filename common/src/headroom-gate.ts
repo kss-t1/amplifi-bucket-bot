@@ -95,14 +95,16 @@ export interface HeadroomDecision {
   headroomPct: number | null;
   requiredPct: number | null;
   hourlyVolPct: number | null;
-  hoursToResolution: number;
+  /** null when the caller could not determine it, which is only usable while
+   *  `timeExponent` is 0 and the requirement does not depend on it. */
+  hoursToResolution: number | null;
 }
 
 export function evaluateHeadroom(
   buffer: PricePoint[],
   strikeUsd: number,
   side: PositionSide,
-  hoursToResolution: number,
+  hoursToResolution: number | null,
   cfg: HeadroomConfig,
 ): HeadroomDecision {
   const spot = buffer.length > 0 ? buffer[buffer.length - 1]!.price : null;
@@ -115,7 +117,10 @@ export function evaluateHeadroom(
   };
   if (vol === null || head === null)
     return { block: false, requiredPct: null, ...base };
-  const hours = Math.max(0, hoursToResolution);
+  // Unknown horizon only matters when the requirement scales with it.
+  if (hoursToResolution === null && cfg.timeExponent !== 0)
+    return { block: false, requiredPct: null, ...base };
+  const hours = Math.max(0, hoursToResolution ?? 0);
   const required =
     cfg.k * vol * (cfg.timeExponent === 0 ? 1 : hours ** cfg.timeExponent);
   return { block: head < required, requiredPct: required * 100, ...base };

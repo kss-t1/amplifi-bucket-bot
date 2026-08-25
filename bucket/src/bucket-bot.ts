@@ -753,11 +753,15 @@ export class BucketBot implements Stoppable {
         break;
       }
     }
-    if (strikeUsd === undefined || end === undefined) return null;
-    const hours = Math.max(
-      0,
-      (new Date(end).getTime() - now.getTime()) / 3_600_000,
-    );
+    if (strikeUsd === undefined) return null;
+    // The end date is only needed when the requirement scales with the horizon;
+    // at the default exponent of 0 a slot whose event has aged out of `events`
+    // is still perfectly checkable.
+    if (end === undefined && this.cfg.headroomTimeExponent !== 0) return null;
+    const hours =
+      end === undefined
+        ? null
+        : Math.max(0, (new Date(end).getTime() - now.getTime()) / 3_600_000);
     const d = evaluateHeadroom(
       this.volGate.prices(),
       strikeUsd,
