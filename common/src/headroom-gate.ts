@@ -25,6 +25,8 @@ import type { PricePoint } from "./vol-gate.ts";
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
+/** Sampling grid for the vol estimate; also what the threshold was tuned on. */
+const GRID_MS = 5 * MIN;
 
 export type PositionSide = "YES" | "NO";
 
@@ -42,19 +44,33 @@ export function hourlyVol(
   maxLookbackSkewMs = 10 * MIN,
 ): number | null {
   if (buffer.length < 2) return null;
-  const last = buffer[buffer.length - 1]!;
+  // Resample to one point per 5 minutes first. The buffer mixes 5-minute seed
+  // candles with 20-second live polls, so counting every point would weight an
+  // hour of live data 15x an hour of seeded data and make the reading depend on
+  // how long the bot has been up. The grid also matches the sampling the
+  // threshold was calibrated on.
+  const grid: PricePoint[] = [];
+  for (const p of buffer) {
+    if (!(p.price > 0)) continue;
+    const bucket = Math.floor(p.ts / GRID_MS);
+    const tail = grid[grid.length - 1];
+    if (tail !== undefined && Math.floor(tail.ts / GRID_MS) === bucket)
+      grid[grid.length - 1] = p;
+    else grid.push(p);
+  }
+  if (grid.length < 2) return null;
+  const last = grid[grid.length - 1]!;
   const from = last.ts - windowMs;
   const rets: number[] = [];
   // `want` only increases, so the lookback index never rewinds: one pass, not a
-  // rescan per point. At 20s polls a 60h buffer holds ~10,800 points and the
-  // quadratic form ran per target, per cycle.
+  // rescan per point.
   let j = 0;
-  for (const p of buffer) {
+  for (const p of grid) {
     if (p.ts < from) continue;
     const want = p.ts - HOUR;
-    while (j + 1 < buffer.length && buffer[j + 1]!.ts <= want) j++;
-    const prior = buffer[j]!;
-    if (prior.ts > want || prior.price <= 0 || p.price <= 0) continue;
+    while (j + 1 < grid.length && grid[j + 1]!.ts <= want) j++;
+    const prior = grid[j]!;
+    if (prior.ts > want || prior.price <= 0) continue;
     if (want - prior.ts > maxLookbackSkewMs) continue;
     rets.push(Math.log(p.price / prior.price));
   }

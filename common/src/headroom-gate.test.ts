@@ -60,10 +60,12 @@ describe("hourlyVol", () => {
     // 30% higher. Every one of them looks back past the hole to that same
     // anchor, so unbounded their returns are near-identical: stdev collapses
     // and a 30% jump reads as dead calm. Bounded, none of them qualify at all.
+    // 12 samples on the 5-minute grid, all inside the hour after the hole, so
+    // every one of them reaches back past it to the anchor.
     const gapped: PricePoint[] = [{ ts: END, price: 100 }];
-    for (let i = 0; i < 13; i++)
+    for (let i = 0; i < 12; i++)
       gapped.push({
-        ts: END + 6 * HOUR + i * 4 * MIN,
+        ts: END + 6 * HOUR + i * 5 * MIN,
         price: 130 * (1 + i * 0.0001),
       });
 
@@ -72,6 +74,24 @@ describe("hourlyVol", () => {
     expect(unbounded!).toBeLessThan(1e-3); // a 30% move measured as ~zero vol
 
     expect(hourlyVol(gapped)).toBeNull(); // bounded: refuses to measure
+  });
+
+  it("a calm 20s-polled stretch cannot drown out a violent 5m-seeded one", () => {
+    // The real buffer is 5-minute seed candles followed by 20-second polls. A
+    // few flat live hours contribute 15x the points per hour, so unresampled
+    // they outvote a genuinely violent seeded day and the gate stops asking for
+    // a cushion right after things go quiet.
+    const pts: PricePoint[] = [];
+    const start = END - 24 * HOUR;
+    for (let t = start; t < END - 4 * HOUR; t += 5 * MIN) {
+      const r = Math.sin(t * 12.9898) * 43758.5453;
+      pts.push({ ts: t, price: 100 * (1 + (r - Math.floor(r) - 0.5) * 0.06) });
+    }
+    for (let t = END - 4 * HOUR; t <= END; t += 20_000)
+      pts.push({ ts: t, price: 100 });
+
+    // Measured: 0.0219 resampled, 0.0143 without — a 35% understatement.
+    expect(hourlyVol(pts)!).toBeGreaterThan(0.018);
   });
 
   it("returns null before enough history accumulates", () => {
