@@ -594,7 +594,14 @@ export class BucketBot implements Stoppable {
     // mid-spike while the gate correctly blocked fresh opens). So whenever
     // opens are gated, also CANCEL the bot's own still-resting, zero-fill open
     // orders. Filled slots (positionId set) keep riding to resolution untouched.
-    if (anyBlock) await this.cancelRestingOpensOnBlock(blockBySide);
+    // slotKey is `event|market|outcome`, so the side is readable off the key.
+    if (anyBlock)
+      await this.cancelRestingOpens(
+        (key) => blockBySide[key.split("|")[2] === "YES" ? "YES" : "NO"],
+      );
+
+    if (this.cfg.headroomGateEnabled)
+      await this.cancelRestingOpens(this.headroomCancelReason(events, now));
 
     for (const t of targets) {
       const key = slotKey(t.eventSlug, t.marketSlug, t.outcome);
@@ -674,17 +681,55 @@ export class BucketBot implements Stoppable {
     events: ReadonlyArray<BtcDailyEvent | null>,
     now: Date,
   ): Record<string, unknown> | null {
+    return this.checkHeadroomFor(t.marketSlug, t.outcome, events, now);
+  }
+
+  /** Cancel-predicate for resting orders whose cushion has since gone. A maker
+   *  order placed on a calm tape otherwise fills after BTC has drifted into the
+   *  strike, which is the trap the vol gate already cancels for. */
+  private headroomCancelReason(
+    events: ReadonlyArray<BtcDailyEvent | null>,
+    now: Date,
+  ): (key: string, slot: OpenSlot) => Record<string, unknown> | null {
+    return (_key, slot) => {
+      const room = this.checkHeadroomFor(
+        slot.marketSlug,
+        slot.outcome,
+        events,
+        now,
+      );
+      return room?.block ? { gate: "headroom", ...room } : null;
+    };
+  }
+
+  /** Keyed by market slug so a RESTING slot, which carries no strike, can be
+   *  re-checked against the same rule as a fresh target. */
+  private checkHeadroomFor(
+    marketSlug: string,
+    outcome: "YES" | "NO",
+    events: ReadonlyArray<BtcDailyEvent | null>,
+    now: Date,
+  ): Record<string, unknown> | null {
     if (!this.cfg.headroomGateEnabled || !this.volGate) return null;
-    const end = events[t.dayIndex]?.endDate;
-    if (end === undefined) return null;
+    let strikeUsd: number | undefined;
+    let end: string | undefined;
+    for (const ev of events) {
+      const hit = ev?.strikes.find((s) => s.slug === marketSlug);
+      if (hit) {
+        strikeUsd = hit.strikeUsd;
+        end = ev!.endDate;
+        break;
+      }
+    }
+    if (strikeUsd === undefined || end === undefined) return null;
     const hours = Math.max(
       0,
       (new Date(end).getTime() - now.getTime()) / 3_600_000,
     );
     const d = evaluateHeadroom(
-      [...this.volGate.prices()],
-      t.strikeUsd,
-      t.outcome,
+      this.volGate.prices(),
+      strikeUsd,
+      outcome,
       hours,
       { k: this.cfg.headroomK, timeExponent: this.cfg.headroomTimeExponent },
     );
@@ -818,17 +863,14 @@ export class BucketBot implements Stoppable {
    * Take-profit SELLs live on filled positions (separate slots with a
    * positionId), so the `positionId == null` filter never touches them.
    */
-  private async cancelRestingOpensOnBlock(
-    blockBySide: Record<"YES" | "NO", Record<string, unknown> | null>,
+  private async cancelRestingOpens(
+    reasonFor: (key: string, slot: OpenSlot) => Record<string, unknown> | null,
   ): Promise<void> {
     if (this.cfg.dryRun) return;
     for (const key of Object.keys(this.state.openByKey)) {
       const slot = this.state.openByKey[key];
       if (!slot || slot.orderId == null || slot.positionId != null) continue;
-      // slotKey is `event|market|outcome` — keep resting orders on a side the
-      // gate is not blocking.
-      const side = key.split("|")[2] === "YES" ? "YES" : "NO";
-      const gate = blockBySide[side];
+      const gate = reasonFor(key, slot);
       if (!gate) continue;
 
       let live;

@@ -215,9 +215,10 @@ export class BtcVolGate {
     this.keepMs = Math.max(maxWindow * 1.25, 30 * MIN, minKeepMs);
   }
 
-  /** Price history backing the rules, for gates that need the same spot feed. */
-  prices(): readonly PricePoint[] {
-    return this.buffer;
+  /** Snapshot of the price history backing the rules, for gates that need the
+   *  same spot feed. Copied so a caller cannot corrupt the buffer. */
+  prices(): PricePoint[] {
+    return this.buffer.map((p) => ({ ...p }));
   }
 
   /** Seed the buffer from 5m klines so long-window rules are warm immediately. */

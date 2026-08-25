@@ -52,13 +52,21 @@ function makeBotForCancel(opts: {
   return {
     // Both sides blocked unless a case narrows it.
     cancel: (
-      blockBySide: unknown = { YES: { gate: "vol" }, NO: { gate: "vol" } },
+      blockBySide: Record<string, unknown> = {
+        YES: { gate: "vol" },
+        NO: { gate: "vol" },
+      },
     ) =>
       (
         bot as unknown as {
-          cancelRestingOpensOnBlock: (g: unknown) => Promise<void>;
+          cancelRestingOpens: (
+            f: (key: string, slot: unknown) => unknown,
+          ) => Promise<void>;
         }
-      ).cancelRestingOpensOnBlock(blockBySide),
+      ).cancelRestingOpens(
+        (key) =>
+          blockBySide[key.split("|")[2] === "YES" ? "YES" : "NO"] ?? null,
+      ),
     openByKey: () =>
       (
         bot as unknown as {
@@ -347,8 +355,13 @@ function makeBotForHeadroom(opts: {
           ) => Record<string, unknown> | null;
         }
       ).checkHeadroom(
-        { strikeUsd, outcome, dayIndex: 0 },
-        events ?? [{ endDate: new Date(endMs).toISOString() }],
+        { marketSlug: "bitcoin-above-Xk", outcome, dayIndex: 0 },
+        events ?? [
+          {
+            endDate: new Date(endMs).toISOString(),
+            strikes: [{ slug: "bitcoin-above-Xk", strikeUsd }],
+          },
+        ],
         new Date(END),
       ),
   };
@@ -388,5 +401,120 @@ describe("checkHeadroom", () => {
     const strike = h.spot * 1.002; // would otherwise block
     expect(h.check(strike, "NO", 0, [null])).toBeNull();
     expect(h.check(strike, "NO", 0, [])).toBeNull();
+  });
+
+  it("returns null when no event lists that market slug", () => {
+    const h = makeBotForHeadroom({ enabled: true });
+    expect(
+      h.check(h.spot * 1.002, "NO", 0, [
+        {
+          endDate: new Date(100_000_000 + SIX_HOURS).toISOString(),
+          strikes: [{ slug: "some-other-market", strikeUsd: 1 }],
+        },
+      ]),
+    ).toBeNull();
+  });
+});
+
+describe("headroom cancels resting orders whose cushion has gone", () => {
+  const MIN = 60_000;
+  const END = 100_000_000;
+  const SIX_HOURS = 6 * 3_600_000;
+
+  /** A bot with the headroom gate on, a fixed price feed, and two resting
+   *  zero-fill orders: one on a strike that is now far too close, one safe. */
+  function harness() {
+    const prices: { ts: number; price: number }[] = [];
+    let x = 100;
+    for (let i = 399; i >= 0; i--) {
+      const r = Math.sin((399 - i) * 12.9898) * 43758.5453;
+      x *= 1 + (r - Math.floor(r) - 0.5) * 0.004;
+      prices.push({ ts: END - i * 5 * MIN, price: x });
+    }
+    const spot = prices[prices.length - 1]!.price;
+    const canceled: number[] = [];
+    const client = {
+      getOrder: async () => ({
+        status: "RESTING",
+        sharesFilled: "0",
+        positionId: null,
+      }),
+      cancelOrder: async (id: number) => {
+        canceled.push(id);
+      },
+    } as never;
+    const cfg = {
+      stateFile: "/tmp/bucket-headroom-cancel-test.json",
+      dryRun: false,
+      headroomGateEnabled: true,
+      headroomK: 7,
+      headroomTimeExponent: 0,
+    } as never;
+    const bot = new BucketBot(cfg, client, {} as never, noopLogger);
+    (bot as unknown as { volGate: unknown }).volGate = {
+      prices: () => prices.map((p) => ({ ...p })),
+    };
+    (
+      bot as unknown as { state: { openByKey: Record<string, unknown> } }
+    ).state.openByKey = {
+      "e|near|NO": {
+        key: "e|near|NO",
+        marketSlug: "near",
+        outcome: "NO",
+        orderId: 10,
+        positionId: null,
+        limitPrice: 0.99,
+      },
+      "e|far|NO": {
+        key: "e|far|NO",
+        marketSlug: "far",
+        outcome: "NO",
+        orderId: 11,
+        positionId: null,
+        limitPrice: 0.99,
+      },
+    };
+    const events = [
+      {
+        endDate: new Date(END + SIX_HOURS).toISOString(),
+        strikes: [
+          { slug: "near", strikeUsd: spot * 1.002 },
+          { slug: "far", strikeUsd: spot * 2 },
+        ],
+      },
+    ];
+    return {
+      canceled,
+      openByKey: () =>
+        (bot as unknown as { state: { openByKey: Record<string, unknown> } })
+          .state.openByKey,
+      sweep: () =>
+        (
+          bot as unknown as {
+            cancelRestingOpens: (f: unknown) => Promise<void>;
+            headroomCancelReason: (e: unknown, n: Date) => unknown;
+          }
+        ).cancelRestingOpens(
+          (
+            bot as unknown as {
+              headroomCancelReason: (e: unknown, n: Date) => unknown;
+            }
+          ).headroomCancelReason(events, new Date(END)),
+        ),
+    };
+  }
+
+  it("cancels the order whose strike is now inside the cushion", async () => {
+    const h = harness();
+    await h.sweep();
+    expect(h.canceled).toEqual([10]);
+    expect(h.openByKey()["e|near|NO"]).toBeUndefined();
+  });
+
+  it("leaves the order with plenty of cushion resting", async () => {
+    const h = harness();
+    await h.sweep();
+    expect(h.canceled).not.toContain(11);
+    expect(h.openByKey()["e|far|NO"]).toBeDefined();
   });
 });
