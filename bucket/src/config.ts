@@ -141,6 +141,13 @@ export interface BucketBotConfig {
   volRules: VolRule[];
   /** Milliseconds between BTC spot polls feeding the gate. Default 20_000. */
   btcVolPollMs: number;
+  /** Headroom gate: refuse an open when BTC sits closer to the strike than
+   *  `headroomK` multiples of realized hourly vol. Default false. */
+  headroomGateEnabled: boolean;
+  /** Multiplier on realized hourly vol. Default 7. */
+  headroomK: number;
+  /** Exponent on hours-to-resolution; 0 = no time scaling. Default 0. */
+  headroomTimeExponent: number;
   /** Block opens for this many ms after THIS bot's own liquidation
    *  (shape-independent re-entry guard). Default unset (off). */
   reentryCooldownMs?: number;
@@ -447,6 +454,14 @@ export function loadConfig(): BucketBotConfig {
   const volGateEnabled =
     (process.env.VOL_GATE_ENABLED ?? "false").toLowerCase() === "true";
   const volRules = parseVolRules(process.env.VOL_GATE_RULES);
+  const headroomGateEnabled =
+    (process.env.HEADROOM_GATE_ENABLED ?? "false").toLowerCase() === "true";
+  const headroomK = Number(process.env.HEADROOM_K ?? 7);
+  if (!(Number.isFinite(headroomK) && headroomK > 0))
+    throw new Error("HEADROOM_K must be a positive number");
+  const headroomTimeExponent = Number(process.env.HEADROOM_TIME_EXPONENT ?? 0);
+  if (!(Number.isFinite(headroomTimeExponent) && headroomTimeExponent >= 0))
+    throw new Error("HEADROOM_TIME_EXPONENT must be a number >= 0");
   const btcVolPollMs = Number(process.env.BTC_VOL_POLL_MS ?? 20_000);
   if (!(Number.isFinite(btcVolPollMs) && btcVolPollMs > 0))
     throw new Error("BTC_VOL_POLL_MS must be a positive number");
@@ -505,6 +520,9 @@ export function loadConfig(): BucketBotConfig {
     volGateEnabled,
     volRules,
     btcVolPollMs,
+    headroomGateEnabled,
+    headroomK,
+    headroomTimeExponent,
     reentryCooldownMs,
     stopLossEnabled,
     stopLossMarginFraction,

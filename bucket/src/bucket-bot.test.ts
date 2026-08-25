@@ -5,6 +5,8 @@ import {
   resolveLiveStrikePrices,
 } from "./bucket-bot.ts";
 import type { BtcDailyEvent, BtcDailyStrike } from "./btc-daily.ts";
+import type { PricePoint } from "../../common/src/vol-gate.ts";
+import { measure } from "../../common/src/headroom-gate.ts";
 
 const noopLogger = { info() {}, warn() {}, error() {} } as never;
 
@@ -51,13 +53,21 @@ function makeBotForCancel(opts: {
   return {
     // Both sides blocked unless a case narrows it.
     cancel: (
-      blockBySide: unknown = { YES: { gate: "vol" }, NO: { gate: "vol" } },
+      blockBySide: Record<string, unknown> = {
+        YES: { gate: "vol" },
+        NO: { gate: "vol" },
+      },
     ) =>
       (
         bot as unknown as {
-          cancelRestingOpensOnBlock: (g: unknown) => Promise<void>;
+          cancelRestingOpens: (
+            f: (key: string, slot: unknown) => unknown,
+          ) => Promise<void>;
         }
-      ).cancelRestingOpensOnBlock(blockBySide),
+      ).cancelRestingOpens(
+        (key) =>
+          blockBySide[key.split("|")[2] === "YES" ? "YES" : "NO"] ?? null,
+      ),
     openByKey: () =>
       (
         bot as unknown as {
@@ -297,5 +307,250 @@ describe("resolveLiveStrikePrices", () => {
     );
     expect(result.droppedStrikes).toBe(1);
     expect(result.events[0]?.strikes).toHaveLength(0);
+  });
+});
+
+/** Build a bot whose vol gate serves a fixed price history, and expose the
+ *  private headroom check. The walk must not repeat hourly or every hourly
+ *  return is zero and the fixture measures no volatility at all. */
+function makeBotForHeadroom(opts: {
+  enabled: boolean;
+  k?: number;
+  timeExponent?: number;
+}) {
+  const MIN = 60_000;
+  const END = 100_000_000;
+  const prices: PricePoint[] = [];
+  let x = 100;
+  for (let i = 399; i >= 0; i--) {
+    const r = Math.sin((399 - i) * 12.9898) * 43758.5453;
+    x *= 1 + (r - Math.floor(r) - 0.5) * 0.004;
+    prices.push({ ts: END - i * 5 * MIN, price: x });
+  }
+  const cfg = {
+    stateFile: "/tmp/bucket-headroom-test.json",
+    dryRun: true,
+    headroomGateEnabled: opts.enabled,
+    headroomK: opts.k ?? 7,
+    headroomTimeExponent: opts.timeExponent ?? 0,
+  } as never;
+  const bot = new BucketBot(cfg, {} as never, {} as never, noopLogger);
+  (bot as unknown as { volGate: unknown }).volGate = {
+    prices: () => prices,
+  };
+  const spot = prices[prices.length - 1]!.price;
+  return {
+    spot,
+    checkKnown: (strikeUsd: number, outcome: "YES" | "NO") =>
+      (
+        bot as unknown as {
+          checkHeadroomFor: (
+            marketSlug: string,
+            outcome: "YES" | "NO",
+            events: unknown,
+            now: Date,
+            vol: unknown,
+            knownStrikeUsd?: number,
+            eventSlug?: string,
+          ) => Record<string, unknown> | null;
+        }
+      ).checkHeadroomFor(
+        "gone",
+        outcome,
+        [],
+        new Date(END),
+        measure(prices),
+        strikeUsd,
+        "gone",
+      ),
+    check: (
+      strikeUsd: number,
+      outcome: "YES" | "NO",
+      endMs: number,
+      events?: unknown,
+    ) =>
+      (
+        bot as unknown as {
+          checkHeadroom: (
+            t: unknown,
+            events: unknown,
+            now: Date,
+            vol: unknown,
+          ) => Record<string, unknown> | null;
+        }
+      ).checkHeadroom(
+        { marketSlug: "bitcoin-above-Xk", outcome, dayIndex: 0 },
+        events ?? [
+          {
+            endDate: new Date(endMs).toISOString(),
+            strikes: [{ slug: "bitcoin-above-Xk", strikeUsd }],
+          },
+        ],
+        new Date(END),
+        measure(prices),
+      ),
+  };
+}
+
+describe("checkHeadroom", () => {
+  const SIX_HOURS = 6 * 3_600_000;
+
+  it("is inert when the gate is disabled", () => {
+    const h = makeBotForHeadroom({ enabled: false });
+    expect(h.check(h.spot + 0.1, "NO", 100_000_000 + SIX_HOURS)).toBeNull();
+  });
+
+  it("blocks a strike sitting inside the required cushion", () => {
+    const h = makeBotForHeadroom({ enabled: true });
+    const d = h.check(h.spot * 1.002, "NO", 100_000_000 + SIX_HOURS)!;
+    expect(d.block).toBe(true);
+    expect(d.gate).toBeUndefined();
+    expect(d.hoursToResolution).toBeCloseTo(6, 3);
+  });
+
+  it("allows a strike well outside it", () => {
+    const h = makeBotForHeadroom({ enabled: true });
+    expect(h.check(h.spot * 2, "NO", 100_000_000 + SIX_HOURS)!.block).toBe(
+      false,
+    );
+  });
+
+  it("derives hours-to-resolution from the day's event", () => {
+    const h = makeBotForHeadroom({ enabled: true });
+    const d = h.check(h.spot * 2, "NO", 100_000_000 + 18 * 3_600_000)!;
+    expect(d.hoursToResolution).toBeCloseTo(18, 3);
+  });
+
+  it("returns null when the day has no event", () => {
+    const h = makeBotForHeadroom({ enabled: true });
+    const strike = h.spot * 1.002; // would otherwise block
+    expect(h.check(strike, "NO", 0, [null])).toBeNull();
+    expect(h.check(strike, "NO", 0, [])).toBeNull();
+  });
+
+  it("checks a slot whose event is gone, using the strike it carries", () => {
+    const bot = makeBotForHeadroom({ enabled: true });
+    const res = bot.checkKnown(bot.spot * 1.002, "NO");
+    expect(res!.block).toBe(true);
+    expect(res!.hoursToResolution).toBeNull();
+  });
+
+  it("returns null when no event lists that market slug", () => {
+    const h = makeBotForHeadroom({ enabled: true });
+    expect(
+      h.check(h.spot * 1.002, "NO", 0, [
+        {
+          endDate: new Date(100_000_000 + SIX_HOURS).toISOString(),
+          strikes: [{ slug: "some-other-market", strikeUsd: 1 }],
+        },
+      ]),
+    ).toBeNull();
+  });
+});
+
+describe("headroom cancels resting orders whose cushion has gone", () => {
+  const MIN = 60_000;
+  const END = 100_000_000;
+  const SIX_HOURS = 6 * 3_600_000;
+
+  /** A bot with the headroom gate on, a fixed price feed, and two resting
+   *  zero-fill orders: one on a strike that is now far too close, one safe. */
+  function harness() {
+    const prices: { ts: number; price: number }[] = [];
+    let x = 100;
+    for (let i = 399; i >= 0; i--) {
+      const r = Math.sin((399 - i) * 12.9898) * 43758.5453;
+      x *= 1 + (r - Math.floor(r) - 0.5) * 0.004;
+      prices.push({ ts: END - i * 5 * MIN, price: x });
+    }
+    const spot = prices[prices.length - 1]!.price;
+    const canceled: number[] = [];
+    const client = {
+      getOrder: async () => ({
+        status: "RESTING",
+        sharesFilled: "0",
+        positionId: null,
+      }),
+      cancelOrder: async (id: number) => {
+        canceled.push(id);
+      },
+    } as never;
+    const cfg = {
+      stateFile: "/tmp/bucket-headroom-cancel-test.json",
+      dryRun: false,
+      headroomGateEnabled: true,
+      headroomK: 7,
+      headroomTimeExponent: 0,
+    } as never;
+    const bot = new BucketBot(cfg, client, {} as never, noopLogger);
+    (bot as unknown as { volGate: unknown }).volGate = {
+      prices: () => prices.map((p) => ({ ...p })),
+    };
+    (
+      bot as unknown as { state: { openByKey: Record<string, unknown> } }
+    ).state.openByKey = {
+      "e|near|NO": {
+        key: "e|near|NO",
+        marketSlug: "near",
+        outcome: "NO",
+        orderId: 10,
+        positionId: null,
+        limitPrice: 0.99,
+      },
+      "e|far|NO": {
+        key: "e|far|NO",
+        marketSlug: "far",
+        outcome: "NO",
+        orderId: 11,
+        positionId: null,
+        limitPrice: 0.99,
+      },
+    };
+    const events = [
+      {
+        endDate: new Date(END + SIX_HOURS).toISOString(),
+        strikes: [
+          { slug: "near", strikeUsd: spot * 1.002 },
+          { slug: "far", strikeUsd: spot * 2 },
+        ],
+      },
+    ];
+    return {
+      canceled,
+      openByKey: () =>
+        (bot as unknown as { state: { openByKey: Record<string, unknown> } })
+          .state.openByKey,
+      sweep: () =>
+        (
+          bot as unknown as {
+            cancelRestingOpens: (f: unknown) => Promise<void>;
+            headroomCancelReason: (e: unknown, n: Date, v: unknown) => unknown;
+          }
+        ).cancelRestingOpens(
+          (
+            bot as unknown as {
+              headroomCancelReason: (
+                e: unknown,
+                n: Date,
+                v: unknown,
+              ) => unknown;
+            }
+          ).headroomCancelReason(events, new Date(END), measure(prices)),
+        ),
+    };
+  }
+
+  it("cancels the order whose strike is now inside the cushion", async () => {
+    const h = harness();
+    await h.sweep();
+    expect(h.canceled).toEqual([10]);
+    expect(h.openByKey()["e|near|NO"]).toBeUndefined();
+  });
+
+  it("leaves the order with plenty of cushion resting", async () => {
+    const h = harness();
+    await h.sweep();
+    expect(h.canceled).not.toContain(11);
+    expect(h.openByKey()["e|far|NO"]).toBeDefined();
   });
 });

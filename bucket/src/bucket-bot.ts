@@ -24,6 +24,11 @@ import {
 import { LendingPoolReader } from "./lending-pool.ts";
 import { BtcVolGate } from "../../common/src/vol-gate.ts";
 import {
+  evaluateHeadroom,
+  measure,
+  type VolMeasurement,
+} from "../../common/src/headroom-gate.ts";
+import {
   emptyStabilityState,
   isStable,
   observe,
@@ -135,6 +140,12 @@ interface OpenSlot {
   bucket: string;
   leverage: number;
   collateralUsd: number;
+  /** Strike and event resolution captured at placement. The live-price overlay
+   *  drops strikes whose book has gone one-sided, so a resting order's strike
+   *  can vanish from `events` while the order is still live; the headroom sweep
+   *  needs it to re-check that order at all. Optional: slots persisted before
+   *  this existed simply fall back to the `events` lookup. */
+  strikeUsd?: number;
   /** Maker limit price (best-bid at place time, rounded down to tick). */
   limitPrice: number;
   /** Tick size we used; needed for reprice escalation. */
@@ -270,7 +281,14 @@ export class BucketBot implements Stoppable {
           )
         : null;
     this.volGate = cfg.volGateEnabled
-      ? new BtcVolGate(cfg.volRules, cfg.btcVolPollMs, logger)
+      ? new BtcVolGate(
+          cfg.volRules,
+          cfg.btcVolPollMs,
+          logger,
+          Date.now,
+          fetch,
+          cfg.headroomGateEnabled ? 30 * 60 * 60 * 1000 : 0,
+        )
       : null;
   }
 
@@ -467,6 +485,39 @@ export class BucketBot implements Stoppable {
     // capital so the planning log stays meaningful. Live-mode fetch failure
     // skips ONLY the new-order placement (return below) — reconcile already
     // ran, so fills / reprices / resolutions are still processed and saved.
+    // Gate on opening NEW positions (vol gate + re-entry cooldown). A
+    // directional vol rule blocks only the side the BTC move hurts, so
+    // evaluate once per side; existing positions, TP, and closes are
+    // unaffected.
+    const blockBySide: Record<"YES" | "NO", Record<string, unknown> | null> = {
+      YES: this.shouldBlockOpens(now.getTime(), "YES"),
+      NO: this.shouldBlockOpens(now.getTime(), "NO"),
+    };
+    // Blocking new opens is not enough: a resting maker BUY placed in a calm
+    // cycle still sits in the book and FILLS if the spike sweeps through it,
+    // re-arming the very directional exposure the gate exists to prevent
+    // (observed live on vm018 2026-06-29 — calm-placed 0.99+ NO orders filled
+    // mid-spike while the gate correctly blocked fresh opens). Filled slots
+    // (positionId set) keep riding to resolution untouched.
+    //
+    // Both sweeps run BEFORE the balance fetch below, because that fetch
+    // returns early when it fails and a flaky cycle is exactly when leaving
+    // gate-blocked orders resting in the book is most expensive.
+    // slotKey is `event|market|outcome`, so the side is readable off the key.
+    if (blockBySide.YES ?? blockBySide.NO)
+      await this.cancelRestingOpens(
+        (key) => blockBySide[key.split("|")[2] === "YES" ? "YES" : "NO"],
+      );
+    // Measured once per cycle: every target and every resting slot reuses it.
+    const vol: VolMeasurement =
+      this.cfg.headroomGateEnabled && this.volGate
+        ? measure(this.volGate.prices())
+        : { spot: null, hourlyVol: null };
+    if (this.cfg.headroomGateEnabled)
+      await this.cancelRestingOpens(
+        this.headroomCancelReason(events, now, vol),
+      );
+
     let capitalUsd: number;
     if (this.cfg.dryRun) {
       capitalUsd = this.cfg.totalCapitalUsd;
@@ -561,10 +612,6 @@ export class BucketBot implements Stoppable {
     // directional vol rule blocks only the side the BTC move hurts, so
     // evaluate once per side; existing positions, TP, and closes are
     // unaffected.
-    const blockBySide: Record<"YES" | "NO", Record<string, unknown> | null> = {
-      YES: this.shouldBlockOpens(now.getTime(), "YES"),
-      NO: this.shouldBlockOpens(now.getTime(), "NO"),
-    };
     const anyBlock = blockBySide.YES ?? blockBySide.NO;
     if (anyBlock && targets.length > 0)
       this.logger.info("skip opens — gate", {
@@ -586,14 +633,22 @@ export class BucketBot implements Stoppable {
     // mid-spike while the gate correctly blocked fresh opens). So whenever
     // opens are gated, also CANCEL the bot's own still-resting, zero-fill open
     // orders. Filled slots (positionId set) keep riding to resolution untouched.
-    if (anyBlock) await this.cancelRestingOpensOnBlock(blockBySide);
-
     for (const t of targets) {
       const key = slotKey(t.eventSlug, t.marketSlug, t.outcome);
       if (this.state.openByKey[key]) continue;
       const gated = blockBySide[t.outcome];
       if (gated) {
         this.recordBlockedOpen(key, t, gated, now.getTime());
+        continue;
+      }
+      const room = this.checkHeadroom(t, events, now, vol);
+      if (room?.block) {
+        this.recordBlockedOpen(
+          key,
+          t,
+          { gate: "headroom", ...room },
+          now.getTime(),
+        );
         continue;
       }
       if (!this.passesStabilityGate(t, now)) continue;
@@ -649,6 +704,93 @@ export class BucketBot implements Stoppable {
 
   /** True when the stability gate is disabled OR the bot has observed this
    *  target's bucket continuously for the configured window. */
+  /** Headroom gate — see `common/src/headroom-gate.ts`. Needs the vol gate's
+   *  price feed, so it is inert when that is off. */
+  private checkHeadroom(
+    t: AllocationTarget,
+    events: ReadonlyArray<BtcDailyEvent | null>,
+    now: Date,
+    vol: VolMeasurement,
+  ): Record<string, unknown> | null {
+    return this.checkHeadroomFor(
+      t.marketSlug,
+      t.outcome,
+      events,
+      now,
+      vol,
+      t.strikeUsd,
+      t.eventSlug,
+    );
+  }
+
+  /** Cancel-predicate for resting orders whose cushion has since gone. A maker
+   *  order placed on a calm tape otherwise fills after BTC has drifted into the
+   *  strike, which is the trap the vol gate already cancels for. */
+  private headroomCancelReason(
+    events: ReadonlyArray<BtcDailyEvent | null>,
+    now: Date,
+    vol: VolMeasurement,
+  ): (key: string, slot: OpenSlot) => Record<string, unknown> | null {
+    return (_key, slot) => {
+      const room = this.checkHeadroomFor(
+        slot.marketSlug,
+        slot.outcome,
+        events,
+        now,
+        vol,
+        slot.strikeUsd,
+        slot.eventSlug,
+      );
+      return room?.block ? { gate: "headroom", ...room } : null;
+    };
+  }
+
+  /** Keyed by market slug so a RESTING slot, which carries no strike, can be
+   *  re-checked against the same rule as a fresh target. */
+  private checkHeadroomFor(
+    marketSlug: string,
+    outcome: "YES" | "NO",
+    events: ReadonlyArray<BtcDailyEvent | null>,
+    now: Date,
+    vol: VolMeasurement,
+    knownStrikeUsd?: number,
+    eventSlug?: string,
+  ): Record<string, unknown> | null {
+    if (!this.cfg.headroomGateEnabled || !this.volGate) return null;
+    let strikeUsd = knownStrikeUsd;
+    let end: string | undefined;
+    for (const ev of events) {
+      if (!ev) continue;
+      if (eventSlug !== undefined && ev.slug === eventSlug) end = ev.endDate;
+      const hit = ev.strikes.find((x) => x.slug === marketSlug);
+      if (hit) {
+        strikeUsd ??= hit.strikeUsd;
+        end ??= ev.endDate;
+        break;
+      }
+    }
+    if (strikeUsd === undefined) return null;
+    // The end date is only needed when the requirement scales with the horizon;
+    // at the default exponent of 0 a slot whose event has aged out of `events`
+    // is still perfectly checkable.
+    if (end === undefined && this.cfg.headroomTimeExponent !== 0) return null;
+    const hours =
+      end === undefined
+        ? null
+        : Math.max(0, (new Date(end).getTime() - now.getTime()) / 3_600_000);
+    const d = evaluateHeadroom(vol, strikeUsd, outcome, hours, {
+      k: this.cfg.headroomK,
+      timeExponent: this.cfg.headroomTimeExponent,
+    });
+    return {
+      block: d.block,
+      headroomPct: d.headroomPct,
+      requiredPct: d.requiredPct,
+      hourlyVolPct: d.hourlyVolPct,
+      hoursToResolution: d.hoursToResolution,
+    };
+  }
+
   private passesStabilityGate(t: AllocationTarget, now: Date): boolean {
     const windowMin = this.cfg.bucketStabilityWindowMin;
     if (windowMin === undefined) return true;
@@ -770,17 +912,14 @@ export class BucketBot implements Stoppable {
    * Take-profit SELLs live on filled positions (separate slots with a
    * positionId), so the `positionId == null` filter never touches them.
    */
-  private async cancelRestingOpensOnBlock(
-    blockBySide: Record<"YES" | "NO", Record<string, unknown> | null>,
+  private async cancelRestingOpens(
+    reasonFor: (key: string, slot: OpenSlot) => Record<string, unknown> | null,
   ): Promise<void> {
     if (this.cfg.dryRun) return;
     for (const key of Object.keys(this.state.openByKey)) {
       const slot = this.state.openByKey[key];
       if (!slot || slot.orderId == null || slot.positionId != null) continue;
-      // slotKey is `event|market|outcome` — keep resting orders on a side the
-      // gate is not blocking.
-      const side = key.split("|")[2] === "YES" ? "YES" : "NO";
-      const gate = blockBySide[side];
+      const gate = reasonFor(key, slot);
       if (!gate) continue;
 
       let live;
@@ -1737,6 +1876,7 @@ export class BucketBot implements Stoppable {
         tokenId: canonicalYesTokenId,
         outcome: t.outcome,
         bucket: t.bucket,
+        strikeUsd: t.strikeUsd,
         leverage,
         collateralUsd: collateral,
         limitPrice,
@@ -1772,6 +1912,7 @@ export class BucketBot implements Stoppable {
         tokenId: canonicalYesTokenId,
         outcome: t.outcome,
         bucket: t.bucket,
+        strikeUsd: t.strikeUsd,
         leverage,
         collateralUsd: collateral,
         limitPrice,
@@ -1949,6 +2090,7 @@ export class BucketBot implements Stoppable {
         tokenId: canonicalYesTokenId,
         outcome: t.outcome,
         bucket: t.bucket,
+        strikeUsd: t.strikeUsd,
         leverage,
         collateralUsd: collateral,
         limitPrice: t.entryPriceMid,
@@ -1992,6 +2134,7 @@ export class BucketBot implements Stoppable {
         tokenId: canonicalYesTokenId,
         outcome: t.outcome,
         bucket: t.bucket,
+        strikeUsd: t.strikeUsd,
         leverage,
         collateralUsd: collateral,
         limitPrice: haveEntry ? entryPrice : t.entryPriceMid,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   absMove,
+  BtcVolGate,
   DEFAULT_VOL_RULES,
   evaluateRules,
   moveHurts,
@@ -187,5 +188,29 @@ describe("directional rules", () => {
     const d = evaluateRules(buf(END, rise), DIR, "YES");
     expect(d.block).toBe(false);
     expect(d.moves["4h:dir"]).toBeCloseTo(10, 4);
+  });
+});
+
+describe("seed", () => {
+  it("drops the still-open candle, whose close time is in the future", async () => {
+    const NOW = 1_000_000_000;
+    // three closed candles plus the open one, which closes 4 minutes from now
+    const rows = [
+      [0, "0", "0", "0", "100", "0", NOW - 10 * MIN],
+      [0, "0", "0", "0", "101", "0", NOW - 5 * MIN],
+      [0, "0", "0", "0", "102", "0", NOW],
+      [0, "0", "0", "0", "103", "0", NOW + 4 * MIN],
+    ];
+    const gate = new BtcVolGate(
+      RULES,
+      1000,
+      { info() {}, warn() {} },
+      () => NOW,
+      (async () => ({ ok: true, json: async () => rows })) as never,
+    );
+    await gate.seed();
+    const ts = gate.prices().map((p) => p.ts);
+    expect(ts).toEqual([NOW - 10 * MIN, NOW - 5 * MIN, NOW]);
+    expect(Math.max(...ts)).toBeLessThanOrEqual(NOW);
   });
 });
