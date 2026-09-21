@@ -117,6 +117,27 @@ describe("loadConfig — bucket / leverage parsing", () => {
     });
   });
 
+  it("HEADROOM_EXIT_ENABLED defaults to false and parses true", () => {
+    expect(loadConfig().headroomExitEnabled).toBe(false);
+    process.env.HEADROOM_EXIT_ENABLED = "true";
+    expect(loadConfig().headroomExitEnabled).toBe(true);
+    process.env.HEADROOM_EXIT_ENABLED = "TRUE";
+    expect(loadConfig().headroomExitEnabled).toBe(true);
+    process.env.HEADROOM_EXIT_ENABLED = "false";
+    expect(loadConfig().headroomExitEnabled).toBe(false);
+  });
+
+  it("HEADROOM_EXIT_FACTOR defaults to 1 and rejects non-positive values", () => {
+    expect(loadConfig().headroomExitFactor).toBe(1);
+    process.env.HEADROOM_EXIT_FACTOR = "1.25";
+    expect(loadConfig().headroomExitFactor).toBe(1.25);
+    for (const bad of ["0", "-1", "abc"]) {
+      process.env.HEADROOM_EXIT_FACTOR = bad;
+      expect(() => loadConfig()).toThrow("HEADROOM_EXIT_FACTOR");
+    }
+    delete process.env.HEADROOM_EXIT_FACTOR;
+  });
+
   it("TP_ACTIVE_EXIT defaults to false and parses true", () => {
     expect(loadConfig().tpActiveExit).toBe(false);
     process.env.TP_ACTIVE_EXIT = "true";

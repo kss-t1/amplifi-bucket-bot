@@ -140,6 +140,8 @@ interface OpenSlot {
   bucket: string;
   leverage: number;
   collateralUsd: number;
+  /** Closed by the headroom exit sweep; kept until reconcile Pass 4 drops it. */
+  headroomExited?: boolean;
   /** Strike and event resolution captured at placement. The live-price overlay
    *  drops strikes whose book has gone one-sided, so a resting order's strike
    *  can vanish from `events` while the order is still live; the headroom sweep
@@ -235,6 +237,8 @@ const EMPTY_STATE = (): PersistedState => ({
  *  `TP_MAX_ATTEMPTS` consecutive failures we stop trying and let the
  *  position ride to resolution like the legacy (no-TP) flow. Mirrors
  *  the harvester's bot tuning. */
+/** Ceiling on closes per cycle; see `closeLostHeadroom`. */
+const HEADROOM_EXIT_MAX_PER_CYCLE = 5;
 const TP_BACKOFF_BASE_MS = 30_000;
 const TP_BACKOFF_MAX_MS = 600_000;
 const TP_MAX_ATTEMPTS = 10;
@@ -725,6 +729,11 @@ export class BucketBot implements Stoppable {
       vol,
       t.strikeUsd,
       t.eventSlug,
+      // Opening at a cushion the sweep would close at is a fee-paying
+      // close/re-open loop, so the entry bar rises to meet it.
+      this.cfg.headroomExitEnabled
+        ? Math.max(1, this.cfg.headroomExitFactor)
+        : 1,
     );
   }
 
@@ -898,41 +907,22 @@ export class BucketBot implements Stoppable {
   }
 
   /**
-   * Headroom EXIT: close filled positions whose cushion has gone.
-   *
-   * The entry gate checks headroom ONCE, when the position opens, and never
-   * again. A position opened with room to spare quietly loses it while BTC
-   * drifts toward the strike, and nothing notices until the liquidation. Every
-   * bucket-bot liquidation wave between 09-10 and 09-21 had that shape: the
-   * gate was right at entry, and the position died hours later.
-   *
-   * So re-run the same check against open positions and close the ones that no
-   * longer clear it. `headroomExitFactor` scales the entry requirement, which
-   * is what separates this from the entry gate: at 1.0 a position is closed at
-   * the same cushion that would have refused to open it.
-   *
-   * It is deliberately wrong most of the time. Backtested over 2,414 positions
-   * (09-08 onward, worst-bid fills) at factor 1.0 it closed 171 positions
-   * early; 110 of those would have been fine and gave up a few cents of
-   * take-profit each, while 60 avoided a liquidation worth ~89% of margin.
-   * Net +$239 against an actual −$215. The gain is concentrated on the four
-   * wave days (+$287) and it LOSES ~$48 across every other day — it is
-   * insurance, priced accordingly, and worth having only while waves keep
-   * arriving. Re-measure before trusting it: see the PR for the method.
-   *
-   * Never touches a slot without a `positionId` — a resting order is the
-   * cancel sweep's job, and closing a position that does not exist yet would
-   * settle the loan against an unfilled order.
+   * Close filled positions whose cushion has gone. The entry gate checks a
+   * position only at open, so one opened with room loses it as BTC drifts into
+   * the strike. `headroomExitFactor` scales the entry requirement.
+   * Measurements: `.claude/rules/bucket-bot-framework.md` -> "Headroom exit".
    */
   private async closeLostHeadroom(
     events: ReadonlyArray<BtcDailyEvent | null>,
     now: Date,
     vol: VolMeasurement,
   ): Promise<void> {
-    if (this.cfg.dryRun) return;
+    // Worst cushion first, and capped: a wave puts every slot over the line at
+    // once, and each close can take MUTATION_TIMEOUT_MS.
+    const due: Array<{ slot: OpenSlot; room: Record<string, unknown> }> = [];
     for (const key of Object.keys(this.state.openByKey)) {
       const slot = this.state.openByKey[key];
-      if (!slot || slot.positionId == null) continue;
+      if (!slot || slot.positionId == null || slot.headroomExited) continue;
       const room = this.checkHeadroomFor(
         slot.marketSlug,
         slot.outcome,
@@ -943,23 +933,17 @@ export class BucketBot implements Stoppable {
         slot.eventSlug,
         this.cfg.headroomExitFactor,
       );
-      if (!room?.block) continue;
-      try {
-        await this.client.closePosition(slot.positionId);
-      } catch (err) {
-        // Leave the slot in place: the next cycle re-checks and retries. A
-        // position we failed to close is still ours, and dropping the slot
-        // would let the allocator re-open the same (event, market, outcome).
-        this.logger.warn("headroom exit: close failed, will retry", {
-          key,
-          positionId: slot.positionId,
-          err: err instanceof ApiError ? err.body.slice(0, 200) : err,
-        });
-        continue;
-      }
-      this.logger.info("headroom_exit_closed", {
+      if (room?.block) due.push({ slot, room });
+    }
+    due.sort(
+      (a, b) =>
+        ((a.room.headroomPct as number | null) ?? 0) -
+        ((b.room.headroomPct as number | null) ?? 0),
+    );
+    for (const { slot, room } of due.slice(0, HEADROOM_EXIT_MAX_PER_CYCLE)) {
+      const entry = {
         ts: now.getTime(),
-        key,
+        key: slot.key,
         positionId: slot.positionId,
         marketSlug: slot.marketSlug,
         outcome: slot.outcome,
@@ -967,10 +951,29 @@ export class BucketBot implements Stoppable {
         collateralUsd: slot.collateralUsd,
         strikeUsd: slot.strikeUsd,
         exitFactor: this.cfg.headroomExitFactor,
+        queued: due.length,
         gate: room,
-      });
-      delete this.state.openByKey[key];
-      delete this.state.repriceCounts[key];
+      };
+      // Log-only in dry run: positionIds there are synthetic.
+      if (this.cfg.dryRun) {
+        this.logger.info("headroom_exit_would_close", entry);
+        continue;
+      }
+      try {
+        await this.client.closePosition(slot.positionId!);
+      } catch (err) {
+        // Unmarked, so the next cycle retries; dropping it would let the
+        // allocator re-open the same market.
+        this.logger.warn("headroom_exit_close_failed", {
+          ...entry,
+          err: err instanceof ApiError ? err.body.slice(0, 200) : err,
+        });
+        continue;
+      }
+      // Mark, don't delete: reconcile Pass 4 drops it once the position is
+      // gone, and holding it meanwhile blocks a same-cycle re-open.
+      slot.headroomExited = true;
+      this.logger.info("headroom_exit_closed", entry);
     }
   }
 

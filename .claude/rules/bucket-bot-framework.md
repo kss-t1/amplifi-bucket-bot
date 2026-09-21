@@ -173,3 +173,46 @@ The 21-bot fleet (v2 bot1-5, v3 bot1-8, v4 bot1-8) runs from **`/home/ubuntu/amp
 - Position/PnL data: vm018 amplifi DB, `positions` table, filtered by bot EOA
 - v2 bot EOAs: bot1 `0xAF3F…7b5a`, bot2 `0x14eD…8e18`, bot3 `0x3eFF…80dd`, bot4 `0x6403…c5a7`, bot5 `0xa99C…E380`
 - v1 bot EOAs: bot1 `0x5158…A71a`, bot2 `0xBfb6…6567`, bot3 `0x49B8…60E4`, bot4 `0xf0Bd…2f93`, bot5 `0x1a30…2C42`
+
+## Headroom exit (`HEADROOM_EXIT_ENABLED`)
+
+The headroom gate checks a position **once, at entry**. A position opened with
+a comfortable cushion loses it as BTC drifts into the strike, and nothing
+notices until the liquidation. Every bucket-bot liquidation wave from 09-10 to
+09-21 had that shape — correct at entry, dead hours later — so the entry gate
+cannot be tuned out of the problem.
+
+The exit sweep re-runs the same check against open positions each cycle and
+closes the ones that no longer clear it. `HEADROOM_EXIT_FACTOR` scales the
+entry requirement; at 1.0 a position closes at the cushion that would have
+refused to open it.
+
+**Measured** over 2,414 positions (09-08 → 09-21, BTC strike markets, every
+exit priced at the worst bid in its 5-minute window):
+
+| factor | early exits | liqs avoided | actual | simulated | delta |
+| --- | --- | --- | --- | --- | --- |
+| 1.50 | 691 | 79 | −$215.35 | −$116.12 | +$99.23 |
+| 1.25 | 418 | 79 | −$215.35 | +$54.66 | +$270.01 |
+| 1.00 | 171 | 60 | −$215.35 | +$23.58 | +$238.93 |
+| 0.75 | 74 | 55 | −$215.35 | −$37.39 | +$177.96 |
+| 0.50 | 16 | 11 | −$215.35 | −$211.54 | +$3.81 |
+
+At 1.0 it closes 171 early: 110 needlessly, 61 for the better, 60 of those
+avoiding a liquidation worth ~89% of margin. That asymmetry — a liquidation
+costs ~38 take-profits — is the whole mechanism.
+
+**It is insurance, not an edge.** The entire gain sits on the four wave days
+(+$287 at factor 1.0); across every other day it **loses ~$48**. Leave it on
+only while waves keep arriving, and re-measure. Four waves in fourteen days is
+the only frequency evidence, and it is thin.
+
+Two limits on the numbers: exits are modelled filling at the observed bid, and
+the 09-18 wave had proven book gaps where that bid may not have been there, so
+wave-day gains are optimistic while ordinary-day costs are not. The factor is
+also fitted on the window it is scored on — 1.25 beating 1.00 is inside the
+noise, so the default is the less-fitted 1.00.
+
+Window starts 09-08 because `pm_price_ticks` is thinned to roughly hourly
+before that (retention), and a replay on thinned ticks detects only ~53% of
+liquidations — enough bias to flip the sign of any such study.
