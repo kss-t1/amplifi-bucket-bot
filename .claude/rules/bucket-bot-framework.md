@@ -213,6 +213,14 @@ wave-day gains are optimistic while ordinary-day costs are not. The factor is
 also fitted on the window it is scored on — 1.25 beating 1.00 is inside the
 noise, so the default is the less-fitted 1.00.
 
+Three things the numbers do NOT include, all of which cut against the rule:
+exit trade fees (171 extra closes at factor 1.0, against a −$48 ordinary-day
+cost); the entry/exit threshold coupling, which at a factor above 1 also raises
+the entry bar and so changes which positions exist at all — the replay uses
+positions opened at plain `k`, so only the 1.0 row is apples-to-apples; and the
+per-cycle cap of 8, since the replay exits at the crossing rather than up to a
+few cycles later.
+
 Window starts 09-08 because `pm_price_ticks` is thinned to roughly hourly
 before that (retention), and a replay on thinned ticks detects only ~53% of
 liquidations — enough bias to flip the sign of any such study.

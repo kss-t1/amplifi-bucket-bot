@@ -474,7 +474,7 @@ export function loadConfig(): BucketBotConfig {
     throw new Error("HEADROOM_EXIT_FACTOR must be a positive number");
   if (headroomExitEnabled && !headroomGateEnabled)
     console.warn(
-      "HEADROOM_EXIT_ENABLED=true but HEADROOM_GATE_ENABLED=false — the exit " +
+      "[config] HEADROOM_EXIT_ENABLED=true but HEADROOM_GATE_ENABLED=false — the exit " +
         "sweep reads the gate's price feed, so it stays inert.",
     );
   const btcVolPollMs = Number(process.env.BTC_VOL_POLL_MS ?? 20_000);

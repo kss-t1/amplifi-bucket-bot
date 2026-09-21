@@ -12,6 +12,8 @@ const ENV_KEYS = [
   "LEVERAGE_97_99",
   "LEVERAGE_99_PLUS",
   "TOTAL_CAPITAL_USD",
+  "HEADROOM_EXIT_ENABLED",
+  "HEADROOM_EXIT_FACTOR",
   "DAYS",
   "DAY_WEIGHTS",
   "TP_ROE_PCT",
@@ -135,7 +137,6 @@ describe("loadConfig — bucket / leverage parsing", () => {
       process.env.HEADROOM_EXIT_FACTOR = bad;
       expect(() => loadConfig()).toThrow("HEADROOM_EXIT_FACTOR");
     }
-    delete process.env.HEADROOM_EXIT_FACTOR;
   });
 
   it("TP_ACTIVE_EXIT defaults to false and parses true", () => {
