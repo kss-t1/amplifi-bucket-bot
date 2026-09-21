@@ -560,9 +560,12 @@ describe("headroom cancels resting orders whose cushion has gone", () => {
 function makeBotForHeadroomExit(opts: {
   exitFactor: number;
   failClose?: boolean;
+  /** Close returns OK but the position is still OPEN afterwards. */
+  closeUnconfirmed?: boolean;
   dryRun?: boolean;
   /** Extra filled slots, keyed by market slug, to test the per-cycle cap. */
   extraNear?: number;
+  exitEnabled?: boolean;
 }) {
   const MIN = 60_000;
   const END = 100_000_000;
@@ -582,6 +585,9 @@ function makeBotForHeadroomExit(opts: {
       closed.push(id);
       return { status: "ok" };
     },
+    // Confirms the close unless the fixture asks for a stuck position.
+    getPosition: async () =>
+      opts.closeUnconfirmed ? { status: "OPEN" } : { status: "CLOSED" },
   } as never;
   const cfg = {
     stateFile: "/tmp/bucket-headroom-exit-test.json",
@@ -589,7 +595,7 @@ function makeBotForHeadroomExit(opts: {
     headroomGateEnabled: true,
     headroomK: 7,
     headroomTimeExponent: 0,
-    headroomExitEnabled: true,
+    headroomExitEnabled: opts.exitEnabled ?? true,
     headroomExitFactor: opts.exitFactor,
   } as never;
   const bot = new BucketBot(cfg, client, {} as never, noopLogger);
@@ -728,15 +734,15 @@ describe("headroom exit sweep", () => {
   });
 
   it("caps closes per cycle, worst cushion first", async () => {
-    const h = makeBotForHeadroomExit({ exitFactor: 1, extraNear: 6 });
+    const h = makeBotForHeadroomExit({ exitFactor: 1, extraNear: 10 });
     await h.run();
-    // 5 per cycle, and 500 (closest to its strike) must be among them.
-    expect(h.closed).toHaveLength(5);
-    expect(h.closed[0]).toBe(500);
+    expect(h.closed).toHaveLength(8);
     // Ascending headroom => ascending strike distance => ascending positionId.
-    expect(h.closed).toEqual([500, 600, 601, 602, 603]);
+    expect(h.closed.slice().sort((a, b) => a - b)).toEqual([
+      500, 600, 601, 602, 603, 604, 605, 606,
+    ]);
     await h.run();
-    expect(h.closed).toHaveLength(7);
+    expect(h.closed).toHaveLength(11);
   });
 
   it("logs the decision without closing in dry run", async () => {
@@ -748,13 +754,44 @@ describe("headroom exit sweep", () => {
   });
 
   it("raises the ENTRY bar to the exit threshold, so it cannot re-open what it just closed", async () => {
+    // The probe must sit BETWEEN the two thresholds or the test cannot fail:
+    // at k=7 the requirement is ~2.2% and at k=10.5 (factor 1.5) it is ~3.3%,
+    // so a 2.5% cushion is admitted by the entry rule alone and refused only
+    // when the exit factor is folded in.
+    // Fixture vol is 0.316%/hr => required 2.212% at k=7, 3.318% at k=10.5.
+    // A 2.5% cushion therefore clears the entry rule on its own and is refused
+    // only once the exit factor is folded in. Probe outside that band and the
+    // test passes with the coupling deleted.
     const h = makeBotForHeadroomExit({ exitFactor: 1.5 });
+    const coupled = h.entryCheck(h.spot * 1.025);
+    expect(coupled?.headroomPct as number).toBeCloseTo(2.5, 1);
+    expect(coupled?.requiredPct as number).toBeCloseTo(3.318, 1);
+    expect(coupled?.block).toBe(true);
+  });
+
+  it("leaves the entry bar alone when the sweep is off", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 1.5, exitEnabled: false });
+    const uncoupled = h.entryCheck(h.spot * 1.025);
+    expect(uncoupled?.requiredPct as number).toBeCloseTo(2.212, 1);
+    expect(uncoupled?.block).toBe(false);
+  });
+
+  it("does not latch when the position is still open after the close", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 1, closeUnconfirmed: true });
     await h.run();
     expect(h.closed).toEqual([500]);
-    // The strike the sweep just closed at must also be refused on entry.
-    const near = h.slots()["e|near|NO"] as { marketSlug: string };
-    void near;
-    const entry = h.entryCheck(h.spot * 1.002);
-    expect(entry?.block).toBe(true);
+    const slot = h.slots()["e|near|NO"] as {
+      headroomExited?: boolean;
+      headroomExitAttempts?: number;
+    };
+    expect(slot.headroomExited).toBeUndefined();
+    expect(slot.headroomExitAttempts).toBe(1);
+  });
+
+  it("stops retrying a slot after repeated failures", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 1, failClose: true });
+    for (let i = 0; i < 7; i++) await h.run();
+    const slot = h.slots()["e|near|NO"] as { headroomExitAttempts?: number };
+    expect(slot.headroomExitAttempts).toBe(5);
   });
 });

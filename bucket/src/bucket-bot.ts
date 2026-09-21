@@ -142,6 +142,8 @@ interface OpenSlot {
   collateralUsd: number;
   /** Closed by the headroom exit sweep; kept until reconcile Pass 4 drops it. */
   headroomExited?: boolean;
+  /** Consecutive failed exit closes; capped by HEADROOM_EXIT_MAX_ATTEMPTS. */
+  headroomExitAttempts?: number;
   /** Strike and event resolution captured at placement. The live-price overlay
    *  drops strikes whose book has gone one-sided, so a resting order's strike
    *  can vanish from `events` while the order is still live; the headroom sweep
@@ -237,11 +239,15 @@ const EMPTY_STATE = (): PersistedState => ({
  *  `TP_MAX_ATTEMPTS` consecutive failures we stop trying and let the
  *  position ride to resolution like the legacy (no-TP) flow. Mirrors
  *  the harvester's bot tuning. */
-/** Ceiling on closes per cycle; see `closeLostHeadroom`. */
-const HEADROOM_EXIT_MAX_PER_CYCLE = 5;
 const TP_BACKOFF_BASE_MS = 30_000;
 const TP_BACKOFF_MAX_MS = 600_000;
 const TP_MAX_ATTEMPTS = 10;
+/** Closes dispatched per cycle by `closeLostHeadroom`. They run concurrently,
+ *  so the cycle costs one MUTATION_TIMEOUT_MS, not N. */
+const HEADROOM_EXIT_MAX_PER_CYCLE = 8;
+/** Consecutive close failures before a slot is left to the liquidation engine
+ *  rather than retried forever. */
+const HEADROOM_EXIT_MAX_ATTEMPTS = 5;
 
 const slotKey = (
   eventSlug: string,
@@ -923,6 +929,10 @@ export class BucketBot implements Stoppable {
     for (const key of Object.keys(this.state.openByKey)) {
       const slot = this.state.openByKey[key];
       if (!slot || slot.positionId == null || slot.headroomExited) continue;
+      // Give up after repeated failures rather than re-dispatching forever;
+      // the liquidation engine remains the backstop.
+      if ((slot.headroomExitAttempts ?? 0) >= HEADROOM_EXIT_MAX_ATTEMPTS)
+        continue;
       const room = this.checkHeadroomFor(
         slot.marketSlug,
         slot.outcome,
@@ -940,41 +950,72 @@ export class BucketBot implements Stoppable {
         ((a.room.headroomPct as number | null) ?? 0) -
         ((b.room.headroomPct as number | null) ?? 0),
     );
-    for (const { slot, room } of due.slice(0, HEADROOM_EXIT_MAX_PER_CYCLE)) {
-      const entry = {
-        ts: now.getTime(),
-        key: slot.key,
-        positionId: slot.positionId,
-        marketSlug: slot.marketSlug,
-        outcome: slot.outcome,
-        leverage: slot.leverage,
-        collateralUsd: slot.collateralUsd,
-        strikeUsd: slot.strikeUsd,
-        exitFactor: this.cfg.headroomExitFactor,
-        queued: due.length,
-        gate: room,
-      };
-      // Log-only in dry run: positionIds there are synthetic.
-      if (this.cfg.dryRun) {
-        this.logger.info("headroom_exit_would_close", entry);
-        continue;
-      }
-      try {
-        await this.client.closePosition(slot.positionId!);
-      } catch (err) {
-        // Unmarked, so the next cycle retries; dropping it would let the
-        // allocator re-open the same market.
-        this.logger.warn("headroom_exit_close_failed", {
-          ...entry,
-          err: err instanceof ApiError ? err.body.slice(0, 200) : err,
-        });
-        continue;
-      }
-      // Mark, don't delete: reconcile Pass 4 drops it once the position is
-      // gone, and holding it meanwhile blocks a same-cycle re-open.
-      slot.headroomExited = true;
-      this.logger.info("headroom_exit_closed", entry);
+    // Concurrently: closes are independent, and serialising them costs one
+    // MUTATION_TIMEOUT_MS each in exactly the wave this exists for.
+    await Promise.all(
+      due
+        .slice(0, HEADROOM_EXIT_MAX_PER_CYCLE)
+        .map(({ slot, room }) => this.exitOne(slot, room, now, due.length)),
+    );
+  }
+
+  /** One exit close: dispatch, VERIFY, then mark. */
+  private async exitOne(
+    slot: OpenSlot,
+    room: Record<string, unknown>,
+    now: Date,
+    queued: number,
+  ): Promise<void> {
+    const entry = {
+      ts: now.getTime(),
+      key: slot.key,
+      positionId: slot.positionId,
+      marketSlug: slot.marketSlug,
+      outcome: slot.outcome,
+      leverage: slot.leverage,
+      collateralUsd: slot.collateralUsd,
+      strikeUsd: slot.strikeUsd,
+      exitFactor: this.cfg.headroomExitFactor,
+      queued,
+      gate: room,
+    };
+    // Log-only in dry run: positionIds there are synthetic.
+    if (this.cfg.dryRun) {
+      this.logger.info("headroom_exit_would_close", entry);
+      return;
     }
+    const positionId = slot.positionId!;
+    try {
+      await this.client.closePosition(positionId);
+      // Verify before latching. `headroomExited` exempts the slot from this
+      // sweep, and reconcile Pass 4 only drops it once the position leaves the
+      // live set — so marking on an unconfirmed close would ride a still-open
+      // position to liquidation in silence.
+      const after = await this.client.getPosition(positionId);
+      if (after !== null && after.status === "OPEN") {
+        slot.headroomExitAttempts = (slot.headroomExitAttempts ?? 0) + 1;
+        this.logger.warn("headroom_exit_close_unconfirmed", {
+          ...entry,
+          attempts: slot.headroomExitAttempts,
+          status: after.status,
+        });
+        return;
+      }
+    } catch (err) {
+      // Unmarked, so the next cycle retries; dropping it would let the
+      // allocator re-open the same market.
+      slot.headroomExitAttempts = (slot.headroomExitAttempts ?? 0) + 1;
+      this.logger.warn("headroom_exit_close_failed", {
+        ...entry,
+        attempts: slot.headroomExitAttempts,
+        err: err instanceof ApiError ? err.body.slice(0, 200) : err,
+      });
+      return;
+    }
+    // Mark, don't delete: reconcile Pass 4 drops it once the position is
+    // gone, and holding it meanwhile blocks a same-cycle re-open.
+    slot.headroomExited = true;
+    this.logger.info("headroom_exit_closed", entry);
   }
 
   /**
