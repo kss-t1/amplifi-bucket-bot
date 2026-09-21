@@ -727,6 +727,14 @@ export class BucketBot implements Stoppable {
    *  target's bucket continuously for the configured window. */
   /** Headroom gate — see `common/src/headroom-gate.ts`. Needs the vol gate's
    *  price feed, so it is inert when that is off. */
+  /** The bar entry, cancel and exit all share. With the sweep on it rises to
+   *  the exit factor, or an order admitted at `k` fills into an instant exit. */
+  private headroomBarMultiplier(): number {
+    return this.cfg.headroomExitEnabled
+      ? Math.max(1, this.cfg.headroomExitFactor)
+      : 1;
+  }
+
   private checkHeadroom(
     t: AllocationTarget,
     events: ReadonlyArray<BtcDailyEvent | null>,
@@ -741,11 +749,7 @@ export class BucketBot implements Stoppable {
       vol,
       t.strikeUsd,
       t.eventSlug,
-      // Opening at a cushion the sweep would close at is a fee-paying
-      // close/re-open loop, so the entry bar rises to meet it.
-      this.cfg.headroomExitEnabled
-        ? Math.max(1, this.cfg.headroomExitFactor)
-        : 1,
+      this.headroomBarMultiplier(),
     );
   }
 
@@ -766,11 +770,7 @@ export class BucketBot implements Stoppable {
         vol,
         slot.strikeUsd,
         slot.eventSlug,
-        // Same bar as the entry and the exit: a resting order left alive at a
-        // cushion the sweep would close at just fills into an instant exit.
-        this.cfg.headroomExitEnabled
-          ? Math.max(1, this.cfg.headroomExitFactor)
-          : 1,
+        this.headroomBarMultiplier(),
       );
       return room?.block ? { gate: "headroom", ...room } : null;
     };
@@ -941,8 +941,25 @@ export class BucketBot implements Stoppable {
     for (const key of Object.keys(this.state.openByKey)) {
       const slot = this.state.openByKey[key];
       if (!slot || slot.positionId == null || slot.headroomExited) continue;
-      // Give up after repeated failures rather than re-dispatching forever;
-      // the liquidation engine remains the backstop.
+      const room = this.checkHeadroomFor(
+        slot.marketSlug,
+        slot.outcome,
+        events,
+        now,
+        vol,
+        slot.strikeUsd,
+        slot.eventSlug,
+        this.cfg.headroomExitFactor,
+      );
+      // Recovery is checked BEFORE abandonment, or a retired slot could never
+      // come back: the cushion is what says the slot is healthy again.
+      if (!room?.block) {
+        if (slot.headroomExitAttempts) {
+          slot.headroomExitAttempts = 0;
+          slot.headroomExitAbandoned = false;
+        }
+        continue;
+      }
       if ((slot.headroomExitAttempts ?? 0) >= HEADROOM_EXIT_MAX_ATTEMPTS) {
         if (!slot.headroomExitAbandoned) {
           slot.headroomExitAbandoned = true;
@@ -955,23 +972,7 @@ export class BucketBot implements Stoppable {
         }
         continue;
       }
-      const room = this.checkHeadroomFor(
-        slot.marketSlug,
-        slot.outcome,
-        events,
-        now,
-        vol,
-        slot.strikeUsd,
-        slot.eventSlug,
-        this.cfg.headroomExitFactor,
-      );
-      if (room?.block) due.push({ slot, room });
-      // Recovered: clear the failure count so transient errors spread over
-      // days cannot permanently retire a healthy slot.
-      else if (slot.headroomExitAttempts) {
-        slot.headroomExitAttempts = 0;
-        slot.headroomExitAbandoned = false;
-      }
+      due.push({ slot, room });
     }
     due.sort(
       (a, b) =>

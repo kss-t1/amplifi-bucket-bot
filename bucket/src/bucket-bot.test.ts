@@ -563,6 +563,10 @@ function makeBotForHeadroomExit(opts: {
   failClose?: boolean;
   /** Close returns OK but the position is still OPEN afterwards. */
   closeUnconfirmed?: boolean;
+  /** getPosition 404s, i.e. the position is gone. */
+  positionGone?: boolean;
+  /** getPosition throws, so the close cannot be confirmed either way. */
+  failVerify?: boolean;
   dryRun?: boolean;
   /** Extra filled slots, keyed by market slug, to test the per-cycle cap. */
   extraNear?: number;
@@ -587,8 +591,11 @@ function makeBotForHeadroomExit(opts: {
       return { status: "ok" };
     },
     // Confirms the close unless the fixture asks for a stuck position.
-    getPosition: async () =>
-      opts.closeUnconfirmed ? { status: "OPEN" } : { status: "CLOSED" },
+    getPosition: async () => {
+      if (opts.failVerify) throw new Error("verify blew up");
+      if (opts.positionGone) return null;
+      return opts.closeUnconfirmed ? { status: "OPEN" } : { status: "CLOSED" };
+    },
   } as never;
   const cfg = {
     stateFile: "/tmp/bucket-headroom-exit-test.json",
@@ -721,13 +728,23 @@ describe("headroom exit call site", () => {
     "utf8",
   )
     .split("\n")
-    .filter((l) => !l.trim().startsWith("//") && !l.trim().startsWith("*"))
+    .filter(
+      (l) =>
+        !l.trim().startsWith("//") &&
+        !l.trim().startsWith("*") &&
+        !l.trim().startsWith("/*"),
+    )
     .join("\n");
 
   it("pollOnce calls the sweep, gated on the headroom gate", () => {
-    expect(src).toContain(
-      "if (this.cfg.headroomGateEnabled)\n      await this.closeLostHeadroom(events, now, vol);",
-    );
+    // Index arithmetic, not an exact-string match: the call must exist and the
+    // nearest preceding guard must be the headroom gate, which survives
+    // reformatting that an indent-sensitive assertion would fail on.
+    const call = src.indexOf("await this.closeLostHeadroom(");
+    expect(call).toBeGreaterThan(0);
+    const guard = src.lastIndexOf("if (this.cfg.headroomGateEnabled)", call);
+    expect(guard).toBeGreaterThan(0);
+    expect(src.slice(guard, call)).not.toContain(";");
   });
 
   it("runs the sweep after the resting-order cancel, not before", () => {
@@ -799,6 +816,46 @@ describe("headroom exit sweep", () => {
     const h = makeBotForHeadroomExit({ exitFactor: 1, exitEnabled: false });
     await h.run();
     expect(h.closed).toEqual([]);
+  });
+
+  it("un-retires an abandoned slot once its cushion recovers", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 1, failClose: true });
+    for (let i = 0; i < 6; i++) await h.run();
+    const slot = h.slots()["e|near|NO"] as {
+      headroomExitAttempts?: number;
+      headroomExitAbandoned?: boolean;
+    };
+    expect(slot.headroomExitAttempts).toBe(5);
+    expect(slot.headroomExitAbandoned).toBe(true);
+    // Recovery must be reachable even from the abandoned state.
+    await h.runWithRoomyStrike();
+    expect(slot.headroomExitAttempts).toBe(0);
+    expect(slot.headroomExitAbandoned).toBe(false);
+  });
+
+  it("marks tpSkipped so the TP pass leaves a closed slot alone", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 1 });
+    await h.run();
+    const slot = h.slots()["e|near|NO"] as { tpSkipped?: boolean };
+    expect(slot.tpSkipped).toBe(true);
+  });
+
+  it("treats a 404 (position gone) as a successful close", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 1, positionGone: true });
+    await h.run();
+    const slot = h.slots()["e|near|NO"] as { headroomExited?: boolean };
+    expect(slot.headroomExited).toBe(true);
+  });
+
+  it("counts a failed verification as an attempt", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 1, failVerify: true });
+    await h.run();
+    const slot = h.slots()["e|near|NO"] as {
+      headroomExited?: boolean;
+      headroomExitAttempts?: number;
+    };
+    expect(slot.headroomExited).toBeUndefined();
+    expect(slot.headroomExitAttempts).toBe(1);
   });
 
   it("clears the failure count once the cushion recovers", async () => {
