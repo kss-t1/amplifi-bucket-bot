@@ -12,6 +12,8 @@ const ENV_KEYS = [
   "LEVERAGE_97_99",
   "LEVERAGE_99_PLUS",
   "TOTAL_CAPITAL_USD",
+  "HEADROOM_EXIT_ENABLED",
+  "HEADROOM_EXIT_FACTOR",
   "DAYS",
   "DAY_WEIGHTS",
   "TP_ROE_PCT",
@@ -115,6 +117,28 @@ describe("loadConfig — bucket / leverage parsing", () => {
       "0.97-0.99": 8,
       "0.99+": 10,
     });
+  });
+
+  it("HEADROOM_EXIT_ENABLED defaults to false and parses true", () => {
+    expect(loadConfig().headroomExitEnabled).toBe(false);
+    process.env.HEADROOM_EXIT_ENABLED = "true";
+    expect(loadConfig().headroomExitEnabled).toBe(true);
+    process.env.HEADROOM_EXIT_ENABLED = "TRUE";
+    expect(loadConfig().headroomExitEnabled).toBe(true);
+    process.env.HEADROOM_EXIT_ENABLED = "false";
+    expect(loadConfig().headroomExitEnabled).toBe(false);
+  });
+
+  it("HEADROOM_EXIT_FACTOR defaults to 1 and rejects non-positive values", () => {
+    expect(loadConfig().headroomExitFactor).toBe(1);
+    process.env.HEADROOM_EXIT_FACTOR = "1.25";
+    expect(loadConfig().headroomExitFactor).toBe(1.25);
+    for (const bad of ["0", "-1", "abc", "10.5", "Infinity"]) {
+      process.env.HEADROOM_EXIT_FACTOR = bad;
+      expect(() => loadConfig()).toThrow("HEADROOM_EXIT_FACTOR");
+    }
+    process.env.HEADROOM_EXIT_FACTOR = "10";
+    expect(loadConfig().headroomExitFactor).toBe(10);
   });
 
   it("TP_ACTIVE_EXIT defaults to false and parses true", () => {

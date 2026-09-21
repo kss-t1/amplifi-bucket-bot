@@ -148,6 +148,11 @@ export interface BucketBotConfig {
   headroomK: number;
   /** Exponent on hours-to-resolution; 0 = no time scaling. Default 0. */
   headroomTimeExponent: number;
+  /** Headroom EXIT: re-check open positions every cycle and close the ones
+   *  whose cushion has gone. Needs the headroom gate. Default false. */
+  headroomExitEnabled: boolean;
+  /** Exit when headroom < this multiple of the entry requirement. Default 1. */
+  headroomExitFactor: number;
   /** Block opens for this many ms after THIS bot's own liquidation
    *  (shape-independent re-entry guard). Default unset (off). */
   reentryCooldownMs?: number;
@@ -462,6 +467,22 @@ export function loadConfig(): BucketBotConfig {
   const headroomTimeExponent = Number(process.env.HEADROOM_TIME_EXPONENT ?? 0);
   if (!(Number.isFinite(headroomTimeExponent) && headroomTimeExponent >= 0))
     throw new Error("HEADROOM_TIME_EXPONENT must be a number >= 0");
+  const headroomExitEnabled =
+    (process.env.HEADROOM_EXIT_ENABLED ?? "false").toLowerCase() === "true";
+  const headroomExitFactor = Number(process.env.HEADROOM_EXIT_FACTOR ?? 1);
+  if (
+    !(
+      Number.isFinite(headroomExitFactor) &&
+      headroomExitFactor > 0 &&
+      headroomExitFactor <= 10
+    )
+  )
+    throw new Error("HEADROOM_EXIT_FACTOR must be a number in (0, 10]");
+  if (headroomExitEnabled && !headroomGateEnabled)
+    console.warn(
+      "[config] HEADROOM_EXIT_ENABLED=true but HEADROOM_GATE_ENABLED=false — the exit " +
+        "sweep reads the gate's price feed, so it stays inert.",
+    );
   const btcVolPollMs = Number(process.env.BTC_VOL_POLL_MS ?? 20_000);
   if (!(Number.isFinite(btcVolPollMs) && btcVolPollMs > 0))
     throw new Error("BTC_VOL_POLL_MS must be a positive number");
@@ -523,6 +544,8 @@ export function loadConfig(): BucketBotConfig {
     headroomGateEnabled,
     headroomK,
     headroomTimeExponent,
+    headroomExitEnabled,
+    headroomExitFactor,
     reentryCooldownMs,
     stopLossEnabled,
     stopLossMarginFraction,
