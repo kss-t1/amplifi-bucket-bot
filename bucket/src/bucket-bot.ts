@@ -144,6 +144,8 @@ interface OpenSlot {
   headroomExited?: boolean;
   /** Consecutive failed exit closes; capped by HEADROOM_EXIT_MAX_ATTEMPTS. */
   headroomExitAttempts?: number;
+  /** Logged-once latch for the abandonment above; cleared on recovery. */
+  headroomExitAbandoned?: boolean;
   /** Strike and event resolution captured at placement. The live-price overlay
    *  drops strikes whose book has gone one-sided, so a resting order's strike
    *  can vanish from `events` while the order is still live; the headroom sweep
@@ -246,7 +248,8 @@ const TP_MAX_ATTEMPTS = 10;
  *  `closePosition` consumes a per-user close nonce, so concurrent calls read
  *  the same nonce and all but one are rejected. */
 const HEADROOM_EXIT_MAX_PER_CYCLE = 5;
-/** Wall-clock budget for the sweep, so a slow backend cannot blow the cycle. */
+/** Budget for DISPATCHING closes. Checked before each one, so a close already
+ *  in flight can still run to MUTATION_TIMEOUT_MS past it. */
 const HEADROOM_EXIT_BUDGET_MS = 45_000;
 /** Consecutive close failures before a slot is left to the liquidation engine
  *  rather than retried forever. */
@@ -940,8 +943,18 @@ export class BucketBot implements Stoppable {
       if (!slot || slot.positionId == null || slot.headroomExited) continue;
       // Give up after repeated failures rather than re-dispatching forever;
       // the liquidation engine remains the backstop.
-      if ((slot.headroomExitAttempts ?? 0) >= HEADROOM_EXIT_MAX_ATTEMPTS)
+      if ((slot.headroomExitAttempts ?? 0) >= HEADROOM_EXIT_MAX_ATTEMPTS) {
+        if (!slot.headroomExitAbandoned) {
+          slot.headroomExitAbandoned = true;
+          this.logger.warn("headroom_exit_abandoned", {
+            key,
+            positionId: slot.positionId,
+            marketSlug: slot.marketSlug,
+            attempts: slot.headroomExitAttempts,
+          });
+        }
         continue;
+      }
       const room = this.checkHeadroomFor(
         slot.marketSlug,
         slot.outcome,
@@ -955,7 +968,10 @@ export class BucketBot implements Stoppable {
       if (room?.block) due.push({ slot, room });
       // Recovered: clear the failure count so transient errors spread over
       // days cannot permanently retire a healthy slot.
-      else if (slot.headroomExitAttempts) slot.headroomExitAttempts = 0;
+      else if (slot.headroomExitAttempts) {
+        slot.headroomExitAttempts = 0;
+        slot.headroomExitAbandoned = false;
+      }
     }
     due.sort(
       (a, b) =>
@@ -966,13 +982,16 @@ export class BucketBot implements Stoppable {
     // these together would have all but one rejected. Bounded by count and by
     // wall clock; the rest roll to the next cycle, still worst-first.
     const deadline = Date.now() + HEADROOM_EXIT_BUDGET_MS;
+    let dispatched = 0;
     for (const { slot, room } of due.slice(0, HEADROOM_EXIT_MAX_PER_CYCLE)) {
       if (Date.now() > deadline) {
         this.logger.warn("headroom_exit_budget_exhausted", {
-          remaining: due.length,
+          dispatched,
+          remaining: due.length - dispatched,
         });
         break;
       }
+      dispatched++;
       await this.exitOne(slot, room, now, due.length);
     }
   }

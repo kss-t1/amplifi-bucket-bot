@@ -133,10 +133,12 @@ describe("loadConfig — bucket / leverage parsing", () => {
     expect(loadConfig().headroomExitFactor).toBe(1);
     process.env.HEADROOM_EXIT_FACTOR = "1.25";
     expect(loadConfig().headroomExitFactor).toBe(1.25);
-    for (const bad of ["0", "-1", "abc"]) {
+    for (const bad of ["0", "-1", "abc", "10.5", "Infinity"]) {
       process.env.HEADROOM_EXIT_FACTOR = bad;
       expect(() => loadConfig()).toThrow("HEADROOM_EXIT_FACTOR");
     }
+    process.env.HEADROOM_EXIT_FACTOR = "10";
+    expect(loadConfig().headroomExitFactor).toBe(10);
   });
 
   it("TP_ACTIVE_EXIT defaults to false and parses true", () => {

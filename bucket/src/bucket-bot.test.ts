@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   applyMaxHoursToResolution,
   BucketBot,
@@ -709,6 +710,33 @@ function makeBotForHeadroomExit(opts: {
         .state.openByKey,
   };
 }
+
+describe("headroom exit call site", () => {
+  // The sweep is only reachable through pollOnce, which needs the whole market
+  // / balance / allocator surface stubbed. Pin the wiring at the source level
+  // instead: comment lines are stripped first, because a comment naming the
+  // method would otherwise satisfy the assertion on its own.
+  const src = readFileSync(
+    new URL("./bucket-bot.ts", import.meta.url),
+    "utf8",
+  )
+    .split("\n")
+    .filter((l) => !l.trim().startsWith("//") && !l.trim().startsWith("*"))
+    .join("\n");
+
+  it("pollOnce calls the sweep, gated on the headroom gate", () => {
+    expect(src).toContain(
+      "if (this.cfg.headroomGateEnabled)\n      await this.closeLostHeadroom(events, now, vol);",
+    );
+  });
+
+  it("runs the sweep after the resting-order cancel, not before", () => {
+    const cancel = src.indexOf("this.headroomCancelReason(events, now, vol)");
+    const sweep = src.indexOf("await this.closeLostHeadroom(");
+    expect(cancel).toBeGreaterThan(0);
+    expect(sweep).toBeGreaterThan(cancel);
+  });
+});
 
 describe("headroom exit sweep", () => {
   it("closes a filled position whose cushion has gone, keeps the roomy one", async () => {

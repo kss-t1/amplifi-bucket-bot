@@ -218,8 +218,17 @@ exit trade fees (171 extra closes at factor 1.0, against a −$48 ordinary-day
 cost); the entry/exit threshold coupling, which at a factor above 1 also raises
 the entry bar and so changes which positions exist at all — the replay uses
 positions opened at plain `k`, so only the 1.0 row is apples-to-apples; and the
-per-cycle cap of 8, since the replay exits at the crossing rather than up to a
+per-cycle cap of 5, since the replay exits at the crossing rather than up to a
 few cycles later.
+
+Operationally: closes are sequential (they share a per-user close nonce, so
+concurrent dispatch has all but one rejected), capped at 5 per cycle and by a
+45s budget that bounds when the LAST close is *dispatched* — a close already in
+flight can still run to `MUTATION_TIMEOUT_MS`. A slot whose close keeps failing
+is abandoned after 5 consecutive attempts (`headroom_exit_abandoned`) and left
+to the liquidation engine; the counter resets once the cushion recovers, so a
+slot oscillating across the threshold is retried indefinitely by design — the
+alternative retires healthy slots permanently.
 
 Window starts 09-08 because `pm_price_ticks` is thinned to roughly hourly
 before that (retention), and a replay on thinned ticks detects only ~53% of
