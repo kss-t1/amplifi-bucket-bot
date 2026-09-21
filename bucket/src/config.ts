@@ -470,8 +470,14 @@ export function loadConfig(): BucketBotConfig {
   const headroomExitEnabled =
     (process.env.HEADROOM_EXIT_ENABLED ?? "false").toLowerCase() === "true";
   const headroomExitFactor = Number(process.env.HEADROOM_EXIT_FACTOR ?? 1);
-  if (!(Number.isFinite(headroomExitFactor) && headroomExitFactor > 0))
-    throw new Error("HEADROOM_EXIT_FACTOR must be a positive number");
+  if (
+    !(
+      Number.isFinite(headroomExitFactor) &&
+      headroomExitFactor > 0 &&
+      headroomExitFactor <= 10
+    )
+  )
+    throw new Error("HEADROOM_EXIT_FACTOR must be a number in (0, 10]");
   if (headroomExitEnabled && !headroomGateEnabled)
     console.warn(
       "[config] HEADROOM_EXIT_ENABLED=true but HEADROOM_GATE_ENABLED=false — the exit " +

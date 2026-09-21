@@ -242,9 +242,12 @@ const EMPTY_STATE = (): PersistedState => ({
 const TP_BACKOFF_BASE_MS = 30_000;
 const TP_BACKOFF_MAX_MS = 600_000;
 const TP_MAX_ATTEMPTS = 10;
-/** Closes dispatched per cycle by `closeLostHeadroom`. They run concurrently,
- *  so the cycle costs one MUTATION_TIMEOUT_MS, not N. */
-const HEADROOM_EXIT_MAX_PER_CYCLE = 8;
+/** Closes attempted per cycle by `closeLostHeadroom`. They are SEQUENTIAL:
+ *  `closePosition` consumes a per-user close nonce, so concurrent calls read
+ *  the same nonce and all but one are rejected. */
+const HEADROOM_EXIT_MAX_PER_CYCLE = 5;
+/** Wall-clock budget for the sweep, so a slow backend cannot blow the cycle. */
+const HEADROOM_EXIT_BUDGET_MS = 45_000;
 /** Consecutive close failures before a slot is left to the liquidation engine
  *  rather than retried forever. */
 const HEADROOM_EXIT_MAX_ATTEMPTS = 5;
@@ -530,7 +533,7 @@ export class BucketBot implements Stoppable {
     // Filled positions, unlike resting orders, are not cancellable — they have
     // to be sold. Runs after the cancel sweep so a slot that is still only an
     // order is handled by the cheaper path first.
-    if (this.cfg.headroomGateEnabled && this.cfg.headroomExitEnabled)
+    if (this.cfg.headroomGateEnabled)
       await this.closeLostHeadroom(events, now, vol);
 
     let capitalUsd: number;
@@ -760,6 +763,11 @@ export class BucketBot implements Stoppable {
         vol,
         slot.strikeUsd,
         slot.eventSlug,
+        // Same bar as the entry and the exit: a resting order left alive at a
+        // cushion the sweep would close at just fills into an instant exit.
+        this.cfg.headroomExitEnabled
+          ? Math.max(1, this.cfg.headroomExitFactor)
+          : 1,
       );
       return room?.block ? { gate: "headroom", ...room } : null;
     };
@@ -923,6 +931,7 @@ export class BucketBot implements Stoppable {
     now: Date,
     vol: VolMeasurement,
   ): Promise<void> {
+    if (!this.cfg.headroomExitEnabled) return;
     // Worst cushion first, and capped: a wave puts every slot over the line at
     // once, and each close can take MUTATION_TIMEOUT_MS.
     const due: Array<{ slot: OpenSlot; room: Record<string, unknown> }> = [];
@@ -944,19 +953,28 @@ export class BucketBot implements Stoppable {
         this.cfg.headroomExitFactor,
       );
       if (room?.block) due.push({ slot, room });
+      // Recovered: clear the failure count so transient errors spread over
+      // days cannot permanently retire a healthy slot.
+      else if (slot.headroomExitAttempts) slot.headroomExitAttempts = 0;
     }
     due.sort(
       (a, b) =>
         ((a.room.headroomPct as number | null) ?? 0) -
         ((b.room.headroomPct as number | null) ?? 0),
     );
-    // Concurrently: closes are independent, and serialising them costs one
-    // MUTATION_TIMEOUT_MS each in exactly the wave this exists for.
-    await Promise.all(
-      due
-        .slice(0, HEADROOM_EXIT_MAX_PER_CYCLE)
-        .map(({ slot, room }) => this.exitOne(slot, room, now, due.length)),
-    );
+    // Sequential: `closePosition` consumes a per-user close nonce, so firing
+    // these together would have all but one rejected. Bounded by count and by
+    // wall clock; the rest roll to the next cycle, still worst-first.
+    const deadline = Date.now() + HEADROOM_EXIT_BUDGET_MS;
+    for (const { slot, room } of due.slice(0, HEADROOM_EXIT_MAX_PER_CYCLE)) {
+      if (Date.now() > deadline) {
+        this.logger.warn("headroom_exit_budget_exhausted", {
+          remaining: due.length,
+        });
+        break;
+      }
+      await this.exitOne(slot, room, now, due.length);
+    }
   }
 
   /** One exit close: dispatch, VERIFY, then mark. */
@@ -991,7 +1009,23 @@ export class BucketBot implements Stoppable {
       // sweep, and reconcile Pass 4 only drops it once the position leaves the
       // live set — so marking on an unconfirmed close would ride a still-open
       // position to liquidation in silence.
-      const after = await this.client.getPosition(positionId);
+      let after: { status: string } | null;
+      try {
+        after = await this.client.getPosition(positionId);
+      } catch (verifyErr) {
+        // The close may well have landed; we just cannot confirm it. Leave the
+        // slot unmarked and let the next cycle re-check.
+        slot.headroomExitAttempts = (slot.headroomExitAttempts ?? 0) + 1;
+        this.logger.warn("headroom_exit_verify_failed", {
+          ...entry,
+          attempts: slot.headroomExitAttempts,
+          err:
+            verifyErr instanceof ApiError
+              ? verifyErr.body.slice(0, 200)
+              : verifyErr,
+        });
+        return;
+      }
       if (after !== null && after.status === "OPEN") {
         slot.headroomExitAttempts = (slot.headroomExitAttempts ?? 0) + 1;
         this.logger.warn("headroom_exit_close_unconfirmed", {
@@ -1015,6 +1049,7 @@ export class BucketBot implements Stoppable {
     // Mark, don't delete: reconcile Pass 4 drops it once the position is
     // gone, and holding it meanwhile blocks a same-cycle re-open.
     slot.headroomExited = true;
+    slot.tpSkipped = true;
     this.logger.info("headroom_exit_closed", entry);
   }
 

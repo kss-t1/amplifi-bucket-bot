@@ -647,7 +647,12 @@ function makeBotForHeadroomExit(opts: {
       positionId: 600 + i,
       limitPrice: 0.99,
     };
-    strikes.push({ slug, strikeUsd: spot * (1.003 + i * 0.0005) });
+    // Deliberately DESCENDING cushion with index, so insertion order is the
+    // reverse of the order the sweep must produce.
+    strikes.push({
+      slug,
+      strikeUsd: spot * (1.003 + ((opts.extraNear ?? 0) - 1 - i) * 0.0005),
+    });
   }
   (
     bot as unknown as { state: { openByKey: Record<string, unknown> } }
@@ -686,6 +691,19 @@ function makeBotForHeadroomExit(opts: {
         new Date(END),
         vol as never,
       ),
+    /** Re-run with `near` moved far from its strike, to prove recovery. */
+    runWithRoomyStrike: () => {
+      strikes[0]!.strikeUsd = spot * 2;
+      return (
+        bot as unknown as {
+          closeLostHeadroom: (
+            e: unknown,
+            now: Date,
+            vol: unknown,
+          ) => Promise<void>;
+        }
+      ).closeLostHeadroom(events as never, new Date(END), vol as never);
+    },
     slots: () =>
       (bot as unknown as { state: { openByKey: Record<string, unknown> } })
         .state.openByKey,
@@ -733,16 +751,36 @@ describe("headroom exit sweep", () => {
     expect(slot.headroomExited).toBeUndefined();
   });
 
-  it("caps closes per cycle, worst cushion first", async () => {
+  it("caps closes per cycle", async () => {
     const h = makeBotForHeadroomExit({ exitFactor: 1, extraNear: 10 });
     await h.run();
-    expect(h.closed).toHaveLength(8);
-    // Ascending headroom => ascending strike distance => ascending positionId.
-    expect(h.closed.slice().sort((a, b) => a - b)).toEqual([
-      500, 600, 601, 602, 603, 604, 605, 606,
-    ]);
+    expect(h.closed).toHaveLength(5);
     await h.run();
-    expect(h.closed).toHaveLength(11);
+    expect(h.closed).toHaveLength(10);
+  });
+
+  it("closes the worst cushion first, against reversed insertion order", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 1, extraNear: 4 });
+    await h.run();
+    // Extras are inserted with DESCENDING urgency, so a missing sort would
+    // yield [500, 600, 601, 602, 603]; the correct order reverses the tail.
+    expect(h.closed).toEqual([500, 603, 602, 601, 600]);
+  });
+
+  it("does nothing when the sweep is disabled", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 1, exitEnabled: false });
+    await h.run();
+    expect(h.closed).toEqual([]);
+  });
+
+  it("clears the failure count once the cushion recovers", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 1, failClose: true });
+    await h.run();
+    const slot = h.slots()["e|near|NO"] as { headroomExitAttempts?: number };
+    expect(slot.headroomExitAttempts).toBe(1);
+    // Same slot, now far from its strike: the sweep must forget the failure.
+    await h.runWithRoomyStrike();
+    expect(slot.headroomExitAttempts).toBe(0);
   });
 
   it("logs the decision without closing in dry run", async () => {
