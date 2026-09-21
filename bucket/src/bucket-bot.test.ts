@@ -554,3 +554,138 @@ describe("headroom cancels resting orders whose cushion has gone", () => {
     expect(h.openByKey()["e|far|NO"]).toBeDefined();
   });
 });
+
+/** Headroom EXIT sweep: filled positions whose cushion has gone get closed;
+ *  ones that still clear the (scaled) requirement are left riding. */
+function makeBotForHeadroomExit(opts: {
+  exitFactor: number;
+  enabled?: boolean;
+  failClose?: boolean;
+}) {
+  const MIN = 60_000;
+  const END = 100_000_000;
+  const SIX_HOURS = 6 * 60 * MIN;
+  const prices: PricePoint[] = [];
+  let x = 100;
+  for (let i = 399; i >= 0; i--) {
+    const r = Math.sin((399 - i) * 12.9898) * 43758.5453;
+    x *= 1 + (r - Math.floor(r) - 0.5) * 0.004;
+    prices.push({ ts: END - i * 5 * MIN, price: x });
+  }
+  const spot = prices[prices.length - 1]!.price;
+  const closed: number[] = [];
+  const client = {
+    closePosition: async (id: number) => {
+      if (opts.failClose) throw new Error("close blew up");
+      closed.push(id);
+      return { status: "ok" };
+    },
+  } as never;
+  const cfg = {
+    stateFile: "/tmp/bucket-headroom-exit-test.json",
+    dryRun: false,
+    headroomGateEnabled: true,
+    headroomK: 7,
+    headroomTimeExponent: 0,
+    headroomExitEnabled: opts.enabled ?? true,
+    headroomExitFactor: opts.exitFactor,
+  } as never;
+  const bot = new BucketBot(cfg, client, {} as never, noopLogger);
+  (bot as unknown as { volGate: unknown }).volGate = {
+    prices: () => prices.map((p) => ({ ...p })),
+  };
+  (
+    bot as unknown as { state: { openByKey: Record<string, unknown> } }
+  ).state.openByKey = {
+    // Filled position sitting very close to its strike.
+    "e|near|NO": {
+      key: "e|near|NO",
+      marketSlug: "near",
+      outcome: "NO",
+      orderId: 10,
+      positionId: 500,
+      limitPrice: 0.99,
+    },
+    // Filled position with a huge cushion.
+    "e|far|NO": {
+      key: "e|far|NO",
+      marketSlug: "far",
+      outcome: "NO",
+      orderId: 11,
+      positionId: 501,
+      limitPrice: 0.99,
+    },
+    // Still only a resting order — the exit sweep must never touch it.
+    "e|near2|NO": {
+      key: "e|near2|NO",
+      marketSlug: "near",
+      outcome: "NO",
+      orderId: 12,
+      positionId: null,
+      limitPrice: 0.99,
+    },
+  };
+  const events = [
+    {
+      endDate: new Date(END + SIX_HOURS).toISOString(),
+      strikes: [
+        { slug: "near", strikeUsd: spot * 1.002 },
+        { slug: "far", strikeUsd: spot * 2 },
+      ],
+    },
+  ];
+  const run = () =>
+    (
+      bot as unknown as {
+        closeLostHeadroom: (
+          e: unknown,
+          now: Date,
+          vol: unknown,
+        ) => Promise<void>;
+      }
+    ).closeLostHeadroom(
+      events as never,
+      new Date(END),
+      measure(prices) as never,
+    );
+  return {
+    closed,
+    run,
+    openByKey: () =>
+      (bot as unknown as { state: { openByKey: Record<string, unknown> } })
+        .state.openByKey,
+  };
+}
+
+describe("headroom exit sweep", () => {
+  it("closes a filled position whose cushion has gone, keeps the roomy one", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 1 });
+    await h.run();
+    expect(h.closed).toEqual([500]);
+    expect(Object.keys(h.openByKey()).sort()).toEqual(["e|far|NO", "e|near2|NO"]);
+  });
+
+  it("never touches a slot that is still only a resting order", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 1 });
+    await h.run();
+    // 12 is the resting order's slot; only positionIds are ever closed.
+    expect(h.closed).not.toContain(12);
+    expect(h.openByKey()["e|near2|NO"]).toBeDefined();
+  });
+
+  it("a smaller exit factor holds a position the entry rule would refuse", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 0.01 });
+    await h.run();
+    expect(h.closed).toEqual([]);
+    expect(Object.keys(h.openByKey())).toHaveLength(3);
+  });
+
+  it("keeps the slot when the close call fails, so the next cycle retries", async () => {
+    const h = makeBotForHeadroomExit({ exitFactor: 1, failClose: true });
+    await h.run();
+    expect(h.closed).toEqual([]);
+    // The slot that should have closed is still there, awaiting a retry.
+    expect(h.openByKey()["e|near|NO"]).toBeDefined();
+    expect(Object.keys(h.openByKey())).toHaveLength(3);
+  });
+});

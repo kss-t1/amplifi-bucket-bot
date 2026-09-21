@@ -517,6 +517,11 @@ export class BucketBot implements Stoppable {
       await this.cancelRestingOpens(
         this.headroomCancelReason(events, now, vol),
       );
+    // Filled positions, unlike resting orders, are not cancellable — they have
+    // to be sold. Runs after the cancel sweep so a slot that is still only an
+    // order is handled by the cheaper path first.
+    if (this.cfg.headroomGateEnabled && this.cfg.headroomExitEnabled)
+      await this.closeLostHeadroom(events, now, vol);
 
     let capitalUsd: number;
     if (this.cfg.dryRun) {
@@ -755,6 +760,9 @@ export class BucketBot implements Stoppable {
     vol: VolMeasurement,
     knownStrikeUsd?: number,
     eventSlug?: string,
+    /** Scales the entry requirement. The exit sweep passes
+     *  `headroomExitFactor` so one formula serves both decisions. */
+    kMultiplier = 1,
   ): Record<string, unknown> | null {
     if (!this.cfg.headroomGateEnabled || !this.volGate) return null;
     let strikeUsd = knownStrikeUsd;
@@ -779,7 +787,7 @@ export class BucketBot implements Stoppable {
         ? null
         : Math.max(0, (new Date(end).getTime() - now.getTime()) / 3_600_000);
     const d = evaluateHeadroom(vol, strikeUsd, outcome, hours, {
-      k: this.cfg.headroomK,
+      k: this.cfg.headroomK * kMultiplier,
       timeExponent: this.cfg.headroomTimeExponent,
     });
     return {
@@ -887,6 +895,83 @@ export class BucketBot implements Stoppable {
       collateralUsd: t.collateralUsd,
       gate,
     });
+  }
+
+  /**
+   * Headroom EXIT: close filled positions whose cushion has gone.
+   *
+   * The entry gate checks headroom ONCE, when the position opens, and never
+   * again. A position opened with room to spare quietly loses it while BTC
+   * drifts toward the strike, and nothing notices until the liquidation. Every
+   * bucket-bot liquidation wave between 09-10 and 09-21 had that shape: the
+   * gate was right at entry, and the position died hours later.
+   *
+   * So re-run the same check against open positions and close the ones that no
+   * longer clear it. `headroomExitFactor` scales the entry requirement, which
+   * is what separates this from the entry gate: at 1.0 a position is closed at
+   * the same cushion that would have refused to open it.
+   *
+   * It is deliberately wrong most of the time. Backtested over 2,414 positions
+   * (09-08 onward, worst-bid fills) at factor 1.0 it closed 171 positions
+   * early; 110 of those would have been fine and gave up a few cents of
+   * take-profit each, while 60 avoided a liquidation worth ~89% of margin.
+   * Net +$239 against an actual −$215. The gain is concentrated on the four
+   * wave days (+$287) and it LOSES ~$48 across every other day — it is
+   * insurance, priced accordingly, and worth having only while waves keep
+   * arriving. Re-measure before trusting it: see the PR for the method.
+   *
+   * Never touches a slot without a `positionId` — a resting order is the
+   * cancel sweep's job, and closing a position that does not exist yet would
+   * settle the loan against an unfilled order.
+   */
+  private async closeLostHeadroom(
+    events: ReadonlyArray<BtcDailyEvent | null>,
+    now: Date,
+    vol: VolMeasurement,
+  ): Promise<void> {
+    if (this.cfg.dryRun) return;
+    for (const key of Object.keys(this.state.openByKey)) {
+      const slot = this.state.openByKey[key];
+      if (!slot || slot.positionId == null) continue;
+      const room = this.checkHeadroomFor(
+        slot.marketSlug,
+        slot.outcome,
+        events,
+        now,
+        vol,
+        slot.strikeUsd,
+        slot.eventSlug,
+        this.cfg.headroomExitFactor,
+      );
+      if (!room?.block) continue;
+      try {
+        await this.client.closePosition(slot.positionId);
+      } catch (err) {
+        // Leave the slot in place: the next cycle re-checks and retries. A
+        // position we failed to close is still ours, and dropping the slot
+        // would let the allocator re-open the same (event, market, outcome).
+        this.logger.warn("headroom exit: close failed, will retry", {
+          key,
+          positionId: slot.positionId,
+          err: err instanceof ApiError ? err.body.slice(0, 200) : err,
+        });
+        continue;
+      }
+      this.logger.info("headroom_exit_closed", {
+        ts: now.getTime(),
+        key,
+        positionId: slot.positionId,
+        marketSlug: slot.marketSlug,
+        outcome: slot.outcome,
+        leverage: slot.leverage,
+        collateralUsd: slot.collateralUsd,
+        strikeUsd: slot.strikeUsd,
+        exitFactor: this.cfg.headroomExitFactor,
+        gate: room,
+      });
+      delete this.state.openByKey[key];
+      delete this.state.repriceCounts[key];
+    }
   }
 
   /**
