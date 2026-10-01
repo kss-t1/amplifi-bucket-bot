@@ -194,6 +194,10 @@ interface OpenSlot {
   /** ms epoch of the most recent setTakeProfit failure. Cleared on
    *  success. */
   tpFailureAt: number | null;
+  /** The last "buy still in flight" 409 and how many have run together. Not
+   *  failures, so `tpFailureCount` is untouched. Absent in older state files. */
+  tpDeferredAt?: number | null;
+  tpDeferCount?: number;
   /** SERVER-side stop-loss price acknowledged by the backend. Null until
    *  the setStopLoss call succeeds; the backend owns the firing from then
    *  on. Optional: state files predating server SLs lack the field. */
@@ -244,6 +248,21 @@ const EMPTY_STATE = (): PersistedState => ({
 const TP_BACKOFF_BASE_MS = 30_000;
 const TP_BACKOFF_MAX_MS = 600_000;
 const TP_MAX_ATTEMPTS = 10;
+/** First wait before re-asking for a take-profit whose buy is still filling;
+ *  doubles per attempt, capped at `TP_BACKOFF_MAX_MS`.
+ *  See .claude/rules/bucket-bot-framework.md -> "Not asking when the answer
+ *  cannot change". */
+const TP_INFLIGHT_DEFER_BASE_MS = 60_000;
+/** How long opens stay off after the backend reports INSUFFICIENT_FUNDS. */
+const INSUFFICIENT_FUNDS_COOLDOWN_MS = 300_000;
+
+/** Wait before the Nth re-ask of a take-profit whose buy is still filling. */
+function tpDeferWait(deferCount: number): number {
+  return Math.min(
+    TP_INFLIGHT_DEFER_BASE_MS * Math.pow(2, Math.max(0, deferCount - 1)),
+    TP_BACKOFF_MAX_MS,
+  );
+}
 /** Closes attempted per cycle by `closeLostHeadroom`. They are SEQUENTIAL:
  *  `closePosition` consumes a per-user close nonce, so concurrent calls read
  *  the same nonce and all but one are rejected. */
@@ -274,6 +293,14 @@ export class BucketBot implements Stoppable {
   /** slotKeys already recorded as gate-blocked in the current block episode
    *  (cleared on any calm cycle), so each prevented open is logged once. */
   private blockLoggedKeys = new Set<string>();
+  /** Spendable balance for this poll tick, seeded by `pollOnce` and debited as
+   *  slots commit. Null = this tick's balance fetch failed. */
+  private availableUsd: number | null = null;
+  /** One out-of-funds log line per tick, not one per target. */
+  private fundsSkipLogged = false;
+  /** Opens stay off until this epoch. In memory on purpose: a restart has a
+   *  fresh balance anyway. */
+  private fundsCooldownUntil = 0;
   /** Consecutive stop-loss breaches per slot key (drift stop debounce —
    *  fire only on the 2nd consecutive breaching poll so a one-tick wick
    *  can't convert a routine dip into a realized loss). In-memory on
@@ -422,6 +449,8 @@ export class BucketBot implements Stoppable {
 
   private async pollOnce(): Promise<void> {
     const now = new Date();
+    this.availableUsd = null;
+    this.fundsSkipLogged = false;
     if (this.volGate) await this.volGate.poll();
     this.logger.info("fetching gamma events", {
       seriesId: this.cfg.btcDailySeriesId,
@@ -542,6 +571,8 @@ export class BucketBot implements Stoppable {
     let capitalUsd: number;
     if (this.cfg.dryRun) {
       capitalUsd = this.cfg.totalCapitalUsd;
+      // Nothing can report a shortfall without the API, so plan every open.
+      this.availableUsd = Number.POSITIVE_INFINITY;
     } else {
       try {
         const bal = await this.client.getBalance();
@@ -552,6 +583,8 @@ export class BucketBot implements Stoppable {
           );
         }
         capitalUsd = Math.max(equity, 0);
+        const spendable = parseFloat(bal.availableBalanceFormatted ?? "0");
+        this.availableUsd = Number.isFinite(spendable) ? spendable : 0;
       } catch (err) {
         this.logger.warn(
           "balance fetch failed; skipping new placements (reconcile already ran)",
@@ -1756,6 +1789,11 @@ export class BucketBot implements Stoppable {
         );
         if (now - slot.tpFailureAt < wait) continue;
       }
+      if (
+        slot.tpDeferredAt != null &&
+        now - slot.tpDeferredAt < tpDeferWait(slot.tpDeferCount ?? 1)
+      )
+        continue;
       // ROE-priced when `tpRoePct` is set, falling back to the fixed
       // DEFAULT_TP_PRICE when the ROE target lands out of range (deep-ITM at
       // low leverage pushes it ≥ 1) or once the book has bid past it
@@ -1788,6 +1826,8 @@ export class BucketBot implements Stoppable {
         slot.tpPrice = tpTick;
         slot.tpFailureCount = 0;
         slot.tpFailureAt = null;
+        slot.tpDeferredAt = null;
+        slot.tpDeferCount = 0;
         this.logger.info("TP set", {
           key: slot.key,
           positionId: slot.positionId,
@@ -1810,10 +1850,14 @@ export class BucketBot implements Stoppable {
           err.status === 409 &&
           /in-flight buy order/i.test(err.body);
         if (isInflightBuy) {
+          slot.tpDeferredAt = now;
+          slot.tpDeferCount = (slot.tpDeferCount ?? 0) + 1;
           this.logger.info("TP deferred — buy still in flight", {
             key: slot.key,
             positionId: slot.positionId,
             tpPrice: tpTick,
+            deferCount: slot.tpDeferCount,
+            nextAttemptInMs: tpDeferWait(slot.tpDeferCount),
           });
           continue;
         }
@@ -1887,6 +1931,43 @@ export class BucketBot implements Stoppable {
                 : err,
         });
       }
+    }
+  }
+
+  /** Subtract committed collateral so a later target in the same tick sees it. */
+  private debitAvailable(collateral: number): void {
+    if (this.availableUsd != null)
+      this.availableUsd = Math.max(0, this.availableUsd - collateral);
+  }
+
+  /** Refuse an open the wallet cannot fund. Reads the balance `pollOnce`
+   *  already fetched; a null one means refuse rather than open blind. */
+  private canFund(collateral: number, marketSlug: string): boolean {
+    const coolingUntil = this.fundsCooldownUntil;
+    const cooling = Date.now() < coolingUntil;
+    const available = this.availableUsd;
+    if (!cooling && available != null && collateral <= available) return true;
+    if (!this.fundsSkipLogged) {
+      this.fundsSkipLogged = true;
+      this.logger.info("skip: cannot fund this open", {
+        reason: cooling
+          ? "insufficient-funds cooldown"
+          : "collateral exceeds available balance",
+        collateralUsd: collateral,
+        availableUsd: available,
+        cooldownRemainingMs: cooling ? coolingUntil - Date.now() : 0,
+        marketSlug,
+      });
+    }
+    return false;
+  }
+
+  /** Catch the race the tick's balance cannot: anything that reserved funds
+   *  between `pollOnce` reading it and this open reaching the backend. */
+  private noteOpenError(err: unknown): void {
+    if (err instanceof ApiError && /INSUFFICIENT_FUNDS/.test(err.body)) {
+      this.fundsCooldownUntil = Date.now() + INSUFFICIENT_FUNDS_COOLDOWN_MS;
+      this.availableUsd = 0;
     }
   }
 
@@ -1967,6 +2048,8 @@ export class BucketBot implements Stoppable {
       });
       return;
     }
+
+    if (!this.canFund(collateral, t.marketSlug)) return;
 
     // Fetch the live CLOB book for the side we're buying. Side = NO trades
     // on `complementTokenId`, YES trades on `tokenId`. Polymarket exposes a
@@ -2112,6 +2195,7 @@ export class BucketBot implements Stoppable {
         tpFailureCount: 0,
         tpFailureAt: null,
       };
+      this.debitAvailable(collateral);
       // Persist immediately so a SIGKILL between placeLimitOrder and the
       // end of the poll can't orphan a live order with no state record.
       await this.store.save(this.state);
@@ -2127,6 +2211,7 @@ export class BucketBot implements Stoppable {
         limitPrice,
       });
     } catch (err) {
+      this.noteOpenError(err);
       this.logger.error(
         "placeLimitOrder failed",
         err instanceof ApiError
@@ -2206,6 +2291,8 @@ export class BucketBot implements Stoppable {
       });
       return;
     }
+
+    if (!this.canFund(collateral, t.marketSlug)) return;
 
     // Final-mile bucket guard for the taker path — fetch the live CLOB
     // book RIGHT before submitting the FAK order so the bucket the order
@@ -2334,6 +2421,7 @@ export class BucketBot implements Stoppable {
         tpFailureCount: 0,
         tpFailureAt: null,
       };
+      this.debitAvailable(collateral);
       // Persist before logging so an unlikely crash between openPosition
       // and end-of-poll save still leaves an attributable slot.
       await this.store.save(this.state);
@@ -2349,6 +2437,7 @@ export class BucketBot implements Stoppable {
         status: res.status,
       });
     } catch (err) {
+      this.noteOpenError(err);
       this.logger.error(
         "openPosition (taker) failed",
         err instanceof ApiError
