@@ -6,6 +6,7 @@ import {
   resolveLiveStrikePrices,
 } from "./bucket-bot.ts";
 import type { BtcDailyEvent, BtcDailyStrike } from "./btc-daily.ts";
+import { ApiError } from "../../common/src/amplifi-client.ts";
 import type { PricePoint } from "../../common/src/vol-gate.ts";
 import { measure } from "../../common/src/headroom-gate.ts";
 
@@ -723,10 +724,7 @@ describe("headroom exit call site", () => {
   // / balance / allocator surface stubbed. Pin the wiring at the source level
   // instead: comment lines are stripped first, because a comment naming the
   // method would otherwise satisfy the assertion on its own.
-  const src = readFileSync(
-    new URL("./bucket-bot.ts", import.meta.url),
-    "utf8",
-  )
+  const src = readFileSync(new URL("./bucket-bot.ts", import.meta.url), "utf8")
     .split("\n")
     .filter(
       (l) =>
@@ -916,5 +914,218 @@ describe("headroom exit sweep", () => {
     for (let i = 0; i < 7; i++) await h.run();
     const slot = h.slots()["e|near|NO"] as { headroomExitAttempts?: number };
     expect(slot.headroomExitAttempts).toBe(5);
+  });
+});
+
+/** Build a BucketBot with a fake `getBalance` and expose the private
+ *  available-funds helpers. `calls` counts balance reads so a test can show
+ *  one read serves a whole tick. */
+function makeBotForFunds(
+  availableUsd: number,
+  opts: { throws?: boolean } = {},
+) {
+  const calls = { balance: 0 };
+  const client = {
+    getBalance: async () => {
+      calls.balance += 1;
+      if (opts.throws) throw new Error("rpc down");
+      return { availableBalanceFormatted: String(availableUsd) } as never;
+    },
+  } as never;
+  const cfg = {
+    stateFile: "/tmp/bucket-funds-test.json",
+    dryRun: false,
+  } as never;
+  const bot = new BucketBot(
+    cfg,
+    client,
+    {} as never,
+    noopLogger,
+  ) as unknown as {
+    canFund: (collateral: number, slug: string) => Promise<boolean>;
+    debitAvailable: (collateral: number) => void;
+    noteOpenError: (err: unknown) => void;
+    availableUsd: number | null;
+    fundsSkipLogged: boolean;
+    fundsCooldownUntil: number;
+  };
+  return { bot, calls };
+}
+
+describe("available-funds gate on opens", () => {
+  it("allows an open the balance covers", async () => {
+    const { bot } = makeBotForFunds(40);
+    expect(await bot.canFund(30, "slug")).toBe(true);
+  });
+
+  it("refuses an open the balance does not cover", async () => {
+    const { bot } = makeBotForFunds(5);
+    expect(await bot.canFund(30, "slug")).toBe(false);
+  });
+
+  it("reads the balance once per tick, not once per target", async () => {
+    const { bot, calls } = makeBotForFunds(40);
+    await bot.canFund(10, "a");
+    await bot.canFund(10, "b");
+    await bot.canFund(10, "c");
+    expect(calls.balance).toBe(1);
+  });
+
+  it("debits committed collateral so the next target in the tick sees it", async () => {
+    const { bot } = makeBotForFunds(40);
+    expect(await bot.canFund(30, "a")).toBe(true);
+    bot.debitAvailable(30);
+    expect(await bot.canFund(30, "b")).toBe(false);
+  });
+
+  it("refuses to open when the balance read fails", async () => {
+    const { bot } = makeBotForFunds(40, { throws: true });
+    expect(await bot.canFund(1, "slug")).toBe(false);
+  });
+
+  it("stops asking for the cooldown after the backend says INSUFFICIENT_FUNDS", async () => {
+    const { bot, calls } = makeBotForFunds(1000);
+    bot.noteOpenError(
+      new ApiError(
+        400,
+        '{"error":"Requested margin $30.00 exceeds available funds $0.00","code":"INSUFFICIENT_FUNDS"}',
+        "POST",
+        "/polymarket/orders",
+      ),
+    );
+    // Null the tick cache the way pollOnce does, so this measures the cooldown
+    // and not the zeroed cache that the same call also sets.
+    bot.availableUsd = null;
+    expect(await bot.canFund(1, "slug")).toBe(false);
+    // The cooldown short-circuits before any balance read.
+    expect(calls.balance).toBe(0);
+  });
+
+  it("leaves opens alone for an unrelated error", async () => {
+    const { bot } = makeBotForFunds(1000);
+    bot.noteOpenError(
+      new ApiError(
+        503,
+        '{"error":"upstream timeout"}',
+        "POST",
+        "/polymarket/orders",
+      ),
+    );
+    expect(await bot.canFund(1, "slug")).toBe(true);
+  });
+});
+
+/** Build a BucketBot whose `setTakeProfit` always rejects with the backend's
+ *  "buy still in flight" 409, with one filled slot seeded. */
+function makeBotForTpDefer() {
+  const attempts: number[] = [];
+  const client = {
+    setTakeProfit: async (positionId: number) => {
+      attempts.push(positionId);
+      throw new ApiError(
+        409,
+        '{"error":"Cannot set take-profit while an in-flight buy order is still acquiring shares"}',
+        "POST",
+        `/polymarket/positions/${positionId}/take-profit`,
+      );
+    },
+  } as never;
+  const cfg = {
+    stateFile: "/tmp/bucket-tpdefer-test.json",
+    dryRun: false,
+    tpRoePct: 2.5,
+  } as never;
+  const bot = new BucketBot(cfg, client, {} as never, noopLogger);
+  const slot = {
+    key: "e|m|YES",
+    leverage: 10,
+    limitPrice: 0.99,
+    tickSize: 0.001,
+    orderId: 1,
+    positionId: 33430,
+    lastPlacedAt: 0,
+    repriceCount: 0,
+    fillPrice: 0.99,
+    tpPrice: null,
+    tpSkipped: false,
+    tpForceFixed: false,
+    tpFailureCount: 0,
+    tpFailureAt: null,
+  };
+  (bot as unknown as { state: { openByKey: unknown } }).state.openByKey = {
+    "e|m|YES": slot,
+  };
+  return {
+    run: () =>
+      (
+        bot as unknown as { ensureTakeProfits: () => Promise<void> }
+      ).ensureTakeProfits(),
+    slot: slot as typeof slot & { tpDeferredAt?: number | null },
+    attempts,
+  };
+}
+
+describe("take-profit on a partially filled buy", () => {
+  it("asks once, then waits out the defer window instead of re-asking every tick", async () => {
+    const h = makeBotForTpDefer();
+    await h.run();
+    await h.run();
+    await h.run();
+    expect(h.attempts.length).toBe(1);
+  });
+
+  // Invariant, not a regression test: the base already re-asked every tick.
+  // This pins that the window expires rather than muting the slot forever.
+  it("re-asks once the defer window has elapsed", async () => {
+    const h = makeBotForTpDefer();
+    await h.run();
+    h.slot.tpDeferredAt = Date.now() - 61_000;
+    await h.run();
+    expect(h.attempts.length).toBe(2);
+  });
+
+  // Invariant, not a regression test: the deferral branch never touched the
+  // failure counter. Pins it so a later edit can't route a wait through the
+  // real-failure backoff and retire the slot after 10 waits.
+  it("does not spend the real-failure retry budget on a deferral", async () => {
+    const h = makeBotForTpDefer();
+    await h.run();
+    expect(h.slot.tpFailureCount).toBe(0);
+    expect(h.slot.tpFailureAt).toBe(null);
+  });
+});
+
+describe("available-funds gate call sites", () => {
+  // Both open paths need the full market / book / allocator surface stubbed to
+  // reach, so pin the wiring at the source level. Comment lines are stripped
+  // first: a comment naming the method would otherwise satisfy the assertion.
+  const src = readFileSync(new URL("./bucket-bot.ts", import.meta.url), "utf8")
+    .split("\n")
+    .filter(
+      (l) =>
+        !l.trim().startsWith("//") &&
+        !l.trim().startsWith("*") &&
+        !l.trim().startsWith("/*"),
+    )
+    .join("\n");
+
+  it("guards both the maker and the taker open path", () => {
+    const guards = src.split("await this.canFund(").length - 1;
+    expect(guards).toBe(2);
+  });
+
+  it("checks funds before submitting, not after", () => {
+    for (const submit of [
+      "await this.client.placeLimitOrder(",
+      "await this.client.openPosition(",
+    ]) {
+      const call = src.indexOf(submit);
+      expect(call).toBeGreaterThan(0);
+      expect(src.lastIndexOf("await this.canFund(", call)).toBeGreaterThan(0);
+    }
+  });
+
+  it("records the backend's own insufficient-funds answer on both paths", () => {
+    expect(src.split("this.noteOpenError(err)").length - 1).toBe(2);
   });
 });
