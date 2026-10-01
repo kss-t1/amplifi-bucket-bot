@@ -1136,6 +1136,8 @@ describe("take-profit on a partially filled buy", () => {
     expect(h.attempts.length).toBe(2);
   });
 
+  // Passes on main too, where the wait is constant. It binds the cap rather
+  // than the growth: drop the Math.min and it goes red.
   it("caps the wait so the slot never stops asking", async () => {
     const h = makeBotForTpDefer();
     h.slot.tpDeferCount = 40;
