@@ -939,7 +939,15 @@ function makeBotForFunds(availableUsd: number | null) {
     stateFile: "/tmp/bucket-funds-test.json",
     dryRun: false,
   } as never;
-  const bot = new BucketBot(cfg, {} as never, {} as never, noopLogger);
+  const logged: Array<Record<string, unknown>> = [];
+  const logger = {
+    info(_msg: string, data?: unknown) {
+      logged.push((data ?? {}) as Record<string, unknown>);
+    },
+    warn() {},
+    error() {},
+  } as never;
+  const bot = new BucketBot(cfg, {} as never, {} as never, logger);
   const inner = bot as unknown as {
     canFund: (collateral: number, slug: string) => boolean;
     debitAvailable: (collateral: number) => void;
@@ -948,7 +956,7 @@ function makeBotForFunds(availableUsd: number | null) {
     fundsSkipLogged: boolean;
   };
   inner.availableUsd = availableUsd;
-  return inner;
+  return Object.assign(inner, { logged });
 }
 
 describe("available-funds gate on opens", () => {
@@ -965,9 +973,10 @@ describe("available-funds gate on opens", () => {
     expect(makeBotForFunds(null).canFund(1, "slug")).toBe(false);
   });
 
-  it("never opens an API call of its own", () => {
-    // The client is {} — a getBalance call here would throw, not return 0.
-    expect(() => makeBotForFunds(40).canFund(30, "slug")).not.toThrow();
+  it("answers synchronously, so it cannot have called the API", () => {
+    // An await on the client would make this a Promise, which is truthy and
+    // would sail through every other assertion in this file.
+    expect(typeof makeBotForFunds(40).canFund(30, "slug")).toBe("boolean");
   });
 
   it("lets dry-run plan every open", () => {
@@ -1003,6 +1012,30 @@ describe("available-funds gate on opens", () => {
     // and not the zeroed balance the same call also writes.
     bot.availableUsd = 1000;
     expect(bot.canFund(1, "slug")).toBe(false);
+  });
+
+  it("says why it is holding off, so a cooldown is not twenty silent ticks", () => {
+    const bot = makeBotForFunds(1000);
+    bot.noteOpenError(
+      new ApiError(
+        400,
+        '{"error":"Requested margin $30.00 exceeds available funds $0.00","code":"INSUFFICIENT_FUNDS"}',
+        "POST",
+        "/polymarket/orders",
+      ),
+    );
+    bot.availableUsd = 1000;
+    bot.canFund(1, "slug");
+    expect(bot.logged.at(-1)?.reason).toBe("insufficient-funds cooldown");
+  });
+
+  it("logs the shortfall once per tick, not once per target", () => {
+    const bot = makeBotForFunds(1);
+    bot.canFund(30, "a");
+    bot.canFund(30, "b");
+    bot.canFund(30, "c");
+    expect(bot.logged.length).toBe(1);
+    expect(bot.logged[0]?.reason).toBe("collateral exceeds available balance");
   });
 
   it("leaves opens alone for an unrelated error", () => {
@@ -1158,6 +1191,13 @@ describe("available-funds gate call sites", () => {
       true,
     );
     expect(src.split("await this.client.getBalance()").length - 1).toBe(2);
+  });
+
+  it("resets both per-tick fields at the top of the tick", () => {
+    const poll = methodBody(src, "private async pollOnce(");
+    expect(poll.includes("this.availableUsd = null;")).toBe(true);
+    // Without this one, only the first out-of-funds tick ever logs.
+    expect(poll.includes("this.fundsSkipLogged = false;")).toBe(true);
   });
 
   it("gives dry-run an unlimited balance so it still plans every open", () => {

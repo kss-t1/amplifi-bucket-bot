@@ -246,17 +246,20 @@ its deposit kept sizing positions against a number from July and the backend
 rejected every one. `pollOnce` now seeds `availableUsd` from the balance it
 already fetches for the allocator — no extra call — and `canFund` refuses any
 open the wallet cannot cover. The figure is debited as each slot commits, so a
-second target in the same tick sees the reduced balance. A null balance (the
-tick's fetch failed) refuses rather than opens blind; dry-run seeds it infinite
-so it still plans every open without touching the API.
+second target in the same tick sees the reduced balance. Dry-run seeds it infinite so it
+still plans every open without touching the API. A null balance refuses rather
+than opening blind — belt and braces, since `pollOnce` already returns before
+the open loop when its own fetch fails.
 
-`availableBalance` is not the whole constraint — the open fee and any order
-that reserved funds since the read are outside it — so a rejection can still
-arrive. `noteOpenError` reads the backend's machine-readable
-`code: "INSUFFICIENT_FUNDS"` (never the message text) and holds opens for five
-minutes. The cooldown is bot-wide, not per market: the constraint is the
-wallet, so a shortfall on one market says nothing good about another. It lives
-in memory, because a restart re-reads the balance anyway.
+The tick's balance is a snapshot, so a rejection can still arrive: the backend
+gates on `margin > availableFunds` read under its own per-wallet lock, and a
+sibling order or a fill can land in between. `noteOpenError` matches
+`INSUFFICIENT_FUNDS` in the response body — the backend puts that token in the
+`code` field and nowhere else, so it survives a reworded message — and holds
+opens for five minutes, saying once per tick that it is doing so. The cooldown
+is bot-wide, not per market: the constraint is the wallet, so a shortfall on one
+market says nothing good about another. It lives in memory, because a restart
+re-reads the balance anyway.
 
 **Take-profits.** The backend refuses a take-profit while the slot's BUY is
 still acquiring shares, so its 409 is a wait, not a failure. It was already

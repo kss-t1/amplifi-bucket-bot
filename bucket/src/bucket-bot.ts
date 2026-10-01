@@ -1943,22 +1943,27 @@ export class BucketBot implements Stoppable {
   /** Refuse an open the wallet cannot fund. Reads the balance `pollOnce`
    *  already fetched; a null one means refuse rather than open blind. */
   private canFund(collateral: number, marketSlug: string): boolean {
-    if (Date.now() < this.fundsCooldownUntil) return false;
+    const coolingUntil = this.fundsCooldownUntil;
+    const cooling = Date.now() < coolingUntil;
     const available = this.availableUsd;
-    if (available != null && collateral <= available) return true;
+    if (!cooling && available != null && collateral <= available) return true;
     if (!this.fundsSkipLogged) {
       this.fundsSkipLogged = true;
-      this.logger.info("skip: collateral exceeds available balance", {
+      this.logger.info("skip: cannot fund this open", {
+        reason: cooling
+          ? "insufficient-funds cooldown"
+          : "collateral exceeds available balance",
         collateralUsd: collateral,
         availableUsd: available,
+        cooldownRemainingMs: cooling ? coolingUntil - Date.now() : 0,
         marketSlug,
       });
     }
     return false;
   }
 
-  /** Catch what `availableBalance` alone misses: the open fee, and anything
-   *  that reserved funds since the balance was read. */
+  /** Catch the race the tick's balance cannot: anything that reserved funds
+   *  between `pollOnce` reading it and this open reaching the backend. */
   private noteOpenError(err: unknown): void {
     if (err instanceof ApiError && /INSUFFICIENT_FUNDS/.test(err.body)) {
       this.fundsCooldownUntil = Date.now() + INSUFFICIENT_FUNDS_COOLDOWN_MS;
