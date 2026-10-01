@@ -233,3 +233,41 @@ alternative retires healthy slots permanently.
 Window starts 09-08 because `pm_price_ticks` is thinned to roughly hourly
 before that (retention), and a replay on thinned ticks detects only ~53% of
 liquidations — enough bias to flip the sign of any such study.
+
+## Not asking when the answer cannot change
+
+A bot that cannot act must not keep asking. Two cases cost the prod API ~154k
+rejections in 24 hours on 2026-10-01, from 15 of the 16 live gen2 bots; one
+real wallet contributed one. Both are fixed in the bot, both are off by
+construction rather than by config.
+
+**Opens.** `getBalance()` used to be read once, at startup, so a bot that spent
+its deposit kept sizing positions against a number from July and the backend
+rejected every one. `pollOnce` now seeds `availableUsd` from the balance it
+already fetches for the allocator — no extra call — and `canFund` refuses any
+open the wallet cannot cover. The figure is debited as each slot commits, so a
+second target in the same tick sees the reduced balance. A null balance (the
+tick's fetch failed) refuses rather than opens blind; dry-run seeds it infinite
+so it still plans every open without touching the API.
+
+`availableBalance` is not the whole constraint — the open fee and any order
+that reserved funds since the read are outside it — so a rejection can still
+arrive. `noteOpenError` reads the backend's machine-readable
+`code: "INSUFFICIENT_FUNDS"` (never the message text) and holds opens for five
+minutes. The cooldown is bot-wide, not per market: the constraint is the
+wallet, so a shortfall on one market says nothing good about another. It lives
+in memory, because a restart re-reads the balance anyway.
+
+**Take-profits.** The backend refuses a take-profit while the slot's BUY is
+still acquiring shares, so its 409 is a wait, not a failure. It was already
+treated as deferred-not-failed, but "deferred" meant _retry on the next tick_ —
+four calls a minute for as long as the partial fill sat there, which for bot 2
+v4 gen2 on position 33430 meant days. The wait now starts at a minute and
+doubles per attempt, capped at `TP_BACKOFF_MAX_MS`: ~144 calls a day instead of
+5,760, and it never stops asking, so the slot still gets its TP the moment the
+buy settles. Deferrals do not touch `tpFailureCount`, so they cannot retire a
+slot through the real-failure budget.
+
+**The bots were also broke**, which is a separate problem this does not solve.
+Eleven of the sixteen were retired on 2026-10-01 (stopped, flattened, drained
+to the bot treasury); five remain.

@@ -194,10 +194,10 @@ interface OpenSlot {
   /** ms epoch of the most recent setTakeProfit failure. Cleared on
    *  success. */
   tpFailureAt: number | null;
-  /** ms epoch of the most recent "buy still in flight" 409. Gates the retry
-   *  on TP_INFLIGHT_DEFER_MS. Not a failure, so it leaves `tpFailureCount`
-   *  alone. Optional: state files written before this field lack it. */
+  /** The last "buy still in flight" 409 and how many have run together. Not
+   *  failures, so `tpFailureCount` is untouched. Absent in older state files. */
   tpDeferredAt?: number | null;
+  tpDeferCount?: number;
   /** SERVER-side stop-loss price acknowledged by the backend. Null until
    *  the setStopLoss call succeeds; the backend owns the firing from then
    *  on. Optional: state files predating server SLs lack the field. */
@@ -248,16 +248,21 @@ const EMPTY_STATE = (): PersistedState => ({
 const TP_BACKOFF_BASE_MS = 30_000;
 const TP_BACKOFF_MAX_MS = 600_000;
 const TP_MAX_ATTEMPTS = 10;
-/** A take-profit cannot be set while the slot's BUY is still filling, so the
- *  backend's 409 is a wait rather than a failure. Re-ask on this slower clock:
- *  a partially filled buy can sit for days, and the old code re-asked on every
- *  poll tick. */
-const TP_INFLIGHT_DEFER_MS = 60_000;
-/** How long to stop trying to open after the backend reports INSUFFICIENT_FUNDS.
- *  The local balance check below catches the common case; this covers the gap
- *  between `availableBalance` and what the backend actually reserves (open fee,
- *  other in-flight orders), which otherwise retries every tick forever. */
+/** First wait before re-asking for a take-profit whose buy is still filling;
+ *  doubles per attempt, capped at `TP_BACKOFF_MAX_MS`.
+ *  See .claude/rules/bucket-bot-framework.md -> "Not asking when the answer
+ *  cannot change". */
+const TP_INFLIGHT_DEFER_BASE_MS = 60_000;
+/** How long opens stay off after the backend reports INSUFFICIENT_FUNDS. */
 const INSUFFICIENT_FUNDS_COOLDOWN_MS = 300_000;
+
+/** Wait before the Nth re-ask of a take-profit whose buy is still filling. */
+function tpDeferWait(deferCount: number): number {
+  return Math.min(
+    TP_INFLIGHT_DEFER_BASE_MS * Math.pow(2, Math.max(0, deferCount - 1)),
+    TP_BACKOFF_MAX_MS,
+  );
+}
 /** Closes attempted per cycle by `closeLostHeadroom`. They are SEQUENTIAL:
  *  `closePosition` consumes a per-user close nonce, so concurrent calls read
  *  the same nonce and all but one are rejected. */
@@ -288,14 +293,13 @@ export class BucketBot implements Stoppable {
   /** slotKeys already recorded as gate-blocked in the current block episode
    *  (cleared on any calm cycle), so each prevented open is logged once. */
   private blockLoggedKeys = new Set<string>();
-  /** Spendable balance for the current poll tick, read at most once and
-   *  debited as slots commit collateral. Null until this tick reads it. */
+  /** Spendable balance for this poll tick, seeded by `pollOnce` and debited as
+   *  slots commit. Null = this tick's balance fetch failed. */
   private availableUsd: number | null = null;
-  /** True once this tick logged an out-of-funds skip, so the other targets
-   *  in the same tick stay quiet. */
+  /** One out-of-funds log line per tick, not one per target. */
   private fundsSkipLogged = false;
-  /** Opens stay off until this epoch after the backend answered
-   *  INSUFFICIENT_FUNDS. */
+  /** Opens stay off until this epoch. In memory on purpose: a restart has a
+   *  fresh balance anyway. */
   private fundsCooldownUntil = 0;
   /** Consecutive stop-loss breaches per slot key (drift stop debounce —
    *  fire only on the 2nd consecutive breaching poll so a one-tick wick
@@ -567,6 +571,8 @@ export class BucketBot implements Stoppable {
     let capitalUsd: number;
     if (this.cfg.dryRun) {
       capitalUsd = this.cfg.totalCapitalUsd;
+      // Nothing can report a shortfall without the API, so plan every open.
+      this.availableUsd = Number.POSITIVE_INFINITY;
     } else {
       try {
         const bal = await this.client.getBalance();
@@ -577,6 +583,8 @@ export class BucketBot implements Stoppable {
           );
         }
         capitalUsd = Math.max(equity, 0);
+        const spendable = parseFloat(bal.availableBalanceFormatted ?? "0");
+        this.availableUsd = Number.isFinite(spendable) ? spendable : 0;
       } catch (err) {
         this.logger.warn(
           "balance fetch failed; skipping new placements (reconcile already ran)",
@@ -1783,7 +1791,7 @@ export class BucketBot implements Stoppable {
       }
       if (
         slot.tpDeferredAt != null &&
-        now - slot.tpDeferredAt < TP_INFLIGHT_DEFER_MS
+        now - slot.tpDeferredAt < tpDeferWait(slot.tpDeferCount ?? 1)
       )
         continue;
       // ROE-priced when `tpRoePct` is set, falling back to the fixed
@@ -1819,6 +1827,7 @@ export class BucketBot implements Stoppable {
         slot.tpFailureCount = 0;
         slot.tpFailureAt = null;
         slot.tpDeferredAt = null;
+        slot.tpDeferCount = 0;
         this.logger.info("TP set", {
           key: slot.key,
           positionId: slot.positionId,
@@ -1841,14 +1850,15 @@ export class BucketBot implements Stoppable {
           err.status === 409 &&
           /in-flight buy order/i.test(err.body);
         if (isInflightBuy) {
-          const firstDefer = slot.tpDeferredAt == null;
           slot.tpDeferredAt = now;
-          if (firstDefer)
-            this.logger.info("TP deferred — buy still in flight", {
-              key: slot.key,
-              positionId: slot.positionId,
-              tpPrice: tpTick,
-            });
+          slot.tpDeferCount = (slot.tpDeferCount ?? 0) + 1;
+          this.logger.info("TP deferred — buy still in flight", {
+            key: slot.key,
+            positionId: slot.positionId,
+            tpPrice: tpTick,
+            deferCount: slot.tpDeferCount,
+            nextAttemptInMs: tpDeferWait(slot.tpDeferCount),
+          });
           continue;
         }
         // The book bid past our ROE target, so a resting TP at that price is
@@ -1924,40 +1934,18 @@ export class BucketBot implements Stoppable {
     }
   }
 
-  /** Spendable balance, read once per poll tick. A failed read returns 0,
-   *  which skips opening this tick rather than opening blind. */
-  private async availableForOpen(): Promise<number> {
-    if (this.availableUsd != null) return this.availableUsd;
-    try {
-      const bal = await this.client.getBalance();
-      const n = parseFloat(bal.availableBalanceFormatted ?? "0");
-      this.availableUsd = Number.isFinite(n) ? n : 0;
-    } catch (err) {
-      this.logger.warn("balance read failed; skipping opens this tick", err);
-      this.availableUsd = 0;
-    }
-    return this.availableUsd;
-  }
-
-  /** Subtract committed collateral so a later target in the SAME tick sees
-   *  the reduced figure instead of the stale pre-order balance. */
+  /** Subtract committed collateral so a later target in the same tick sees it. */
   private debitAvailable(collateral: number): void {
     if (this.availableUsd != null)
       this.availableUsd = Math.max(0, this.availableUsd - collateral);
   }
 
-  /** Refuse an open the wallet cannot fund. The backend rejects it anyway;
-   *  without this the bot re-asked every poll tick per target, which is how
-   *  a fleet of spent bots put ~150k rejected opens a day into the prod API
-   *  log (vm018, Sep 2026). */
-  private async canFund(
-    collateral: number,
-    marketSlug: string,
-  ): Promise<boolean> {
-    const now = Date.now();
-    if (now < this.fundsCooldownUntil) return false;
-    const available = await this.availableForOpen();
-    if (collateral <= available) return true;
+  /** Refuse an open the wallet cannot fund. Reads the balance `pollOnce`
+   *  already fetched; a null one means refuse rather than open blind. */
+  private canFund(collateral: number, marketSlug: string): boolean {
+    if (Date.now() < this.fundsCooldownUntil) return false;
+    const available = this.availableUsd;
+    if (available != null && collateral <= available) return true;
     if (!this.fundsSkipLogged) {
       this.fundsSkipLogged = true;
       this.logger.info("skip: collateral exceeds available balance", {
@@ -1969,9 +1957,8 @@ export class BucketBot implements Stoppable {
     return false;
   }
 
-  /** Back off for INSUFFICIENT_FUNDS_COOLDOWN_MS when the backend says the
-   *  wallet is short. Covers what `availableBalance` alone does not: the open
-   *  fee and any order that reserved funds since the balance was read. */
+  /** Catch what `availableBalance` alone misses: the open fee, and anything
+   *  that reserved funds since the balance was read. */
   private noteOpenError(err: unknown): void {
     if (err instanceof ApiError && /INSUFFICIENT_FUNDS/.test(err.body)) {
       this.fundsCooldownUntil = Date.now() + INSUFFICIENT_FUNDS_COOLDOWN_MS;
@@ -2057,7 +2044,7 @@ export class BucketBot implements Stoppable {
       return;
     }
 
-    if (!(await this.canFund(collateral, t.marketSlug))) return;
+    if (!this.canFund(collateral, t.marketSlug)) return;
 
     // Fetch the live CLOB book for the side we're buying. Side = NO trades
     // on `complementTokenId`, YES trades on `tokenId`. Polymarket exposes a
@@ -2300,7 +2287,7 @@ export class BucketBot implements Stoppable {
       return;
     }
 
-    if (!(await this.canFund(collateral, t.marketSlug))) return;
+    if (!this.canFund(collateral, t.marketSlug)) return;
 
     // Final-mile bucket guard for the taker path — fetch the live CLOB
     // book RIGHT before submitting the FAK order so the bucket the order
