@@ -6,10 +6,35 @@ import {
   resolveLiveStrikePrices,
 } from "./bucket-bot.ts";
 import type { BtcDailyEvent, BtcDailyStrike } from "./btc-daily.ts";
+import { ApiError } from "../../common/src/amplifi-client.ts";
 import type { PricePoint } from "../../common/src/vol-gate.ts";
 import { measure } from "../../common/src/headroom-gate.ts";
 
 const noopLogger = { info() {}, warn() {}, error() {} } as never;
+
+/** Source of a module with comment lines removed, for tests that pin wiring
+ *  the full stub surface cannot reach. Comments are stripped because one
+ *  naming the method under test would satisfy the assertion on its own. */
+function strippedSource(relativePath: string): string {
+  return readFileSync(new URL(relativePath, import.meta.url), "utf8")
+    .split("\n")
+    .filter(
+      (l) =>
+        !l.trim().startsWith("//") &&
+        !l.trim().startsWith("*") &&
+        !l.trim().startsWith("/*"),
+    )
+    .join("\n");
+}
+
+/** One method's body, from its signature to the start of the next method, so a
+ *  per-path assertion cannot match a sibling path's code. */
+function methodBody(src: string, signature: string): string {
+  const start = src.indexOf(signature);
+  if (start < 0) throw new Error(`method not found: ${signature}`);
+  const end = src.indexOf("\n  private ", start + signature.length);
+  return src.slice(start, end < 0 ? undefined : end);
+}
 
 type FakeOrder = {
   status: string;
@@ -720,21 +745,8 @@ function makeBotForHeadroomExit(opts: {
 
 describe("headroom exit call site", () => {
   // The sweep is only reachable through pollOnce, which needs the whole market
-  // / balance / allocator surface stubbed. Pin the wiring at the source level
-  // instead: comment lines are stripped first, because a comment naming the
-  // method would otherwise satisfy the assertion on its own.
-  const src = readFileSync(
-    new URL("./bucket-bot.ts", import.meta.url),
-    "utf8",
-  )
-    .split("\n")
-    .filter(
-      (l) =>
-        !l.trim().startsWith("//") &&
-        !l.trim().startsWith("*") &&
-        !l.trim().startsWith("/*"),
-    )
-    .join("\n");
+  // / balance / allocator surface stubbed. Pin the wiring at the source level.
+  const src = strippedSource("./bucket-bot.ts");
 
   it("pollOnce calls the sweep, gated on the headroom gate", () => {
     // Index arithmetic, not an exact-string match: the call must exist and the
@@ -916,5 +928,286 @@ describe("headroom exit sweep", () => {
     for (let i = 0; i < 7; i++) await h.run();
     const slot = h.slots()["e|near|NO"] as { headroomExitAttempts?: number };
     expect(slot.headroomExitAttempts).toBe(5);
+  });
+});
+
+/** A BucketBot with the private funds-gate internals exposed. The balance is
+ *  seeded the way `pollOnce` seeds it; the client is empty so any API call
+ *  from this path would throw. */
+function makeBotForFunds(availableUsd: number | null) {
+  const cfg = {
+    stateFile: "/tmp/bucket-funds-test.json",
+    dryRun: false,
+  } as never;
+  const logged: Array<Record<string, unknown>> = [];
+  const logger = {
+    info(_msg: string, data?: unknown) {
+      logged.push((data ?? {}) as Record<string, unknown>);
+    },
+    warn() {},
+    error() {},
+  } as never;
+  const bot = new BucketBot(cfg, {} as never, {} as never, logger);
+  const inner = bot as unknown as {
+    canFund: (collateral: number, slug: string) => boolean;
+    debitAvailable: (collateral: number) => void;
+    noteOpenError: (err: unknown) => void;
+    availableUsd: number | null;
+    fundsSkipLogged: boolean;
+  };
+  inner.availableUsd = availableUsd;
+  return Object.assign(inner, { logged });
+}
+
+describe("available-funds gate on opens", () => {
+  it("allows an open the balance covers", () => {
+    expect(makeBotForFunds(40).canFund(30, "slug")).toBe(true);
+  });
+
+  it("refuses an open the balance does not cover", () => {
+    expect(makeBotForFunds(5).canFund(30, "slug")).toBe(false);
+  });
+
+  it("refuses to open when the tick has no balance", () => {
+    // pollOnce leaves it null when its own balance fetch failed.
+    expect(makeBotForFunds(null).canFund(1, "slug")).toBe(false);
+  });
+
+  it("answers synchronously, so it cannot have called the API", () => {
+    // An await on the client would make this a Promise, which is truthy and
+    // would sail through every other assertion in this file.
+    expect(typeof makeBotForFunds(40).canFund(30, "slug")).toBe("boolean");
+  });
+
+  it("lets dry-run plan every open", () => {
+    expect(makeBotForFunds(Number.POSITIVE_INFINITY).canFund(1e9, "slug")).toBe(
+      true,
+    );
+  });
+
+  it("debits committed collateral so the next target in the tick sees it", () => {
+    const bot = makeBotForFunds(40);
+    expect(bot.canFund(30, "a")).toBe(true);
+    bot.debitAvailable(30);
+    expect(bot.canFund(30, "b")).toBe(false);
+  });
+
+  it("leaves a dry-run balance untouched when a slot commits", () => {
+    const bot = makeBotForFunds(Number.POSITIVE_INFINITY);
+    bot.debitAvailable(500);
+    expect(bot.canFund(1e9, "slug")).toBe(true);
+  });
+
+  it("stops asking for the cooldown after the backend says INSUFFICIENT_FUNDS", () => {
+    const bot = makeBotForFunds(1000);
+    bot.noteOpenError(
+      new ApiError(
+        400,
+        '{"error":"Requested margin $30.00 exceeds available funds $0.00","code":"INSUFFICIENT_FUNDS"}',
+        "POST",
+        "/polymarket/orders",
+      ),
+    );
+    // Re-seed the way the next pollOnce would, so this measures the cooldown
+    // and not the zeroed balance the same call also writes.
+    bot.availableUsd = 1000;
+    expect(bot.canFund(1, "slug")).toBe(false);
+  });
+
+  it("says why it is holding off, so a cooldown is not twenty silent ticks", () => {
+    const bot = makeBotForFunds(1000);
+    bot.noteOpenError(
+      new ApiError(
+        400,
+        '{"error":"Requested margin $30.00 exceeds available funds $0.00","code":"INSUFFICIENT_FUNDS"}',
+        "POST",
+        "/polymarket/orders",
+      ),
+    );
+    bot.availableUsd = 1000;
+    bot.canFund(1, "slug");
+    expect(bot.logged.at(-1)?.reason).toBe("insufficient-funds cooldown");
+  });
+
+  it("logs the shortfall once per tick, not once per target", () => {
+    const bot = makeBotForFunds(1);
+    bot.canFund(30, "a");
+    bot.canFund(30, "b");
+    bot.canFund(30, "c");
+    expect(bot.logged.length).toBe(1);
+    expect(bot.logged[0]?.reason).toBe("collateral exceeds available balance");
+  });
+
+  it("leaves opens alone for an unrelated error", () => {
+    const bot = makeBotForFunds(1000);
+    bot.noteOpenError(
+      new ApiError(
+        503,
+        '{"error":"upstream timeout"}',
+        "POST",
+        "/polymarket/orders",
+      ),
+    );
+    expect(bot.canFund(1, "slug")).toBe(true);
+  });
+});
+
+/** Build a BucketBot whose `setTakeProfit` always rejects with the backend's
+ *  "buy still in flight" 409, with one filled slot seeded. */
+function makeBotForTpDefer() {
+  const attempts: number[] = [];
+  const client = {
+    setTakeProfit: async (positionId: number) => {
+      attempts.push(positionId);
+      throw new ApiError(
+        409,
+        '{"error":"Cannot set take-profit while an in-flight buy order is still acquiring shares"}',
+        "POST",
+        `/polymarket/positions/${positionId}/take-profit`,
+      );
+    },
+  } as never;
+  const cfg = {
+    stateFile: "/tmp/bucket-tpdefer-test.json",
+    dryRun: false,
+    tpRoePct: 2.5,
+  } as never;
+  const bot = new BucketBot(cfg, client, {} as never, noopLogger);
+  const slot = {
+    key: "e|m|YES",
+    leverage: 10,
+    limitPrice: 0.99,
+    tickSize: 0.001,
+    orderId: 1,
+    positionId: 33430,
+    lastPlacedAt: 0,
+    repriceCount: 0,
+    fillPrice: 0.99,
+    tpPrice: null,
+    tpSkipped: false,
+    tpForceFixed: false,
+    tpFailureCount: 0,
+    tpFailureAt: null,
+  };
+  (bot as unknown as { state: { openByKey: unknown } }).state.openByKey = {
+    "e|m|YES": slot,
+  };
+  return {
+    run: () =>
+      (
+        bot as unknown as { ensureTakeProfits: () => Promise<void> }
+      ).ensureTakeProfits(),
+    slot: slot as typeof slot & {
+      tpDeferredAt?: number | null;
+      tpDeferCount?: number;
+    },
+    attempts,
+  };
+}
+
+describe("take-profit on a partially filled buy", () => {
+  it("asks once, then waits out the defer window instead of re-asking every tick", async () => {
+    const h = makeBotForTpDefer();
+    await h.run();
+    await h.run();
+    await h.run();
+    expect(h.attempts.length).toBe(1);
+  });
+
+  // Invariant, not a regression test: the base already re-asked every tick.
+  // This pins that the window expires rather than muting the slot forever.
+  it("re-asks once the defer window has elapsed", async () => {
+    const h = makeBotForTpDefer();
+    await h.run();
+    h.slot.tpDeferredAt = Date.now() - 61_000;
+    await h.run();
+    expect(h.attempts.length).toBe(2);
+  });
+
+  it("widens the wait each time, so a buy stalled for days stops costing a call a minute", async () => {
+    const h = makeBotForTpDefer();
+    await h.run();
+    // Age the slot by the FIRST window; the second must not fire yet.
+    h.slot.tpDeferredAt = Date.now() - 61_000;
+    await h.run();
+    expect(h.attempts.length).toBe(2);
+    h.slot.tpDeferredAt = Date.now() - 61_000;
+    await h.run();
+    expect(h.attempts.length).toBe(2);
+  });
+
+  // Passes on main too, where the wait is constant. It binds the cap rather
+  // than the growth: drop the Math.min and it goes red.
+  it("caps the wait so the slot never stops asking", async () => {
+    const h = makeBotForTpDefer();
+    h.slot.tpDeferCount = 40;
+    h.slot.tpDeferredAt = Date.now() - 601_000;
+    await h.run();
+    expect(h.attempts.length).toBe(1);
+  });
+
+  // Invariant, not a regression test: the deferral branch never touched the
+  // failure counter. Pins it so a later edit can't route a wait through the
+  // real-failure backoff and retire the slot after 10 waits.
+  it("does not spend the real-failure retry budget on a deferral", async () => {
+    const h = makeBotForTpDefer();
+    await h.run();
+    expect(h.slot.tpFailureCount).toBe(0);
+    expect(h.slot.tpFailureAt).toBe(null);
+  });
+});
+
+describe("available-funds gate call sites", () => {
+  // Both open paths need the full market / book / allocator surface stubbed to
+  // reach, so pin the wiring at the source level.
+  const src = strippedSource("./bucket-bot.ts");
+  const maker = methodBody(src, "private async tryPlaceMakerOrder(");
+  const taker = methodBody(src, "private async tryOpenTaker(");
+
+  it("guards each open path in its own body", () => {
+    for (const [name, body, submit] of [
+      ["maker", maker, "await this.client.placeLimitOrder("],
+      ["taker", taker, "await this.client.openPosition("],
+    ] as const) {
+      const guard = body.indexOf("this.canFund(");
+      const call = body.indexOf(submit);
+      expect([name, guard > 0, call > 0]).toEqual([name, true, true]);
+      expect([name, guard < call]).toEqual([name, true]);
+    }
+  });
+
+  it("debits the committed collateral on each open path", () => {
+    expect(maker.includes("this.debitAvailable(collateral)")).toBe(true);
+    expect(taker.includes("this.debitAvailable(collateral)")).toBe(true);
+  });
+
+  it("records the backend's own insufficient-funds answer on both paths", () => {
+    expect(maker.includes("this.noteOpenError(err)")).toBe(true);
+    expect(taker.includes("this.noteOpenError(err)")).toBe(true);
+  });
+
+  it("seeds the tick's balance from the allocator's own fetch", () => {
+    // Nothing else may call getBalance per tick; the allocator read already
+    // carries the figure.
+    expect(src.includes("this.availableUsd = Number.isFinite(spendable)")).toBe(
+      true,
+    );
+    expect(src.split("await this.client.getBalance()").length - 1).toBe(2);
+  });
+
+  it("resets both per-tick fields at the top of the tick", () => {
+    const poll = methodBody(src, "private async pollOnce(");
+    expect(poll.includes("this.availableUsd = null;")).toBe(true);
+    // Without this one, only the first out-of-funds tick ever logs.
+    expect(poll.includes("this.fundsSkipLogged = false;")).toBe(true);
+  });
+
+  it("gives dry-run an unlimited balance so it still plans every open", () => {
+    const poll = methodBody(src, "private async pollOnce(");
+    const dryRun = poll.indexOf("if (this.cfg.dryRun) {");
+    expect(dryRun).toBeGreaterThan(0);
+    expect(
+      poll.indexOf("this.availableUsd = Number.POSITIVE_INFINITY", dryRun),
+    ).toBeGreaterThan(dryRun);
   });
 });
