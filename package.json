@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@polymarket/clob-client-v2": "1.0.3",
     "viem": "2.47.0"
   },
   "devDependencies": {
