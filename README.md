@@ -348,3 +348,51 @@ on the next allocator pass.
   `scripts/btc-sim/` 500ms simulator on historical orderbook snapshots
   (see Notion writeup). Live PnL should be compared against the maker $100
   row of that analysis to gauge taker-fee + slippage drag.
+
+## Fair value (BTC daily strikes)
+
+`common/src/fair-value.ts` prices a daily-above strike as the probability that
+the Binance BTC/USDT 1-minute close at resolution ends above the strike. It
+treats the strike as a digital option on a driftless lognormal, with three
+adjustments fitted on history:
+
+- **Hour-of-day volatility profile.** Variance per UTC hour, so a horizon
+  covering the US session carries more uncertainty than the same hours at
+  night.
+- **Volatility window and scale.** The trailing window for realized hourly
+  volatility, and a multiplier on it.
+- **Fat tails.** A second, wider regime mixed in at constant total variance,
+  because BTC jumps more often than a normal distribution allows.
+
+Usage:
+
+```ts
+import { fairValue } from "./common/src/fair-value.ts";
+import { hourlyVol } from "./common/src/headroom-gate.ts";
+import { BTC_FAIR_VALUE_PARAMS as P } from "./common/src/btc-fair-value-params.ts";
+
+const vol = hourlyVol(prices, P.windowHours * 3_600_000);
+const fv = vol === null ? null : fairValue({
+  spot, strikeUsd, nowMs: Date.now(), endMs: Date.parse(event.endDate),
+  hourlyVol: vol * P.volScale, profile: P.profile, tails: P.tails,
+});
+```
+
+The price buffer must cover the fitted window. The live `BtcVolGate` keeps
+about 24 hours, so a caller using a longer window has to seed more history.
+
+Refit and re-test with:
+
+```sh
+bun scripts/fair-value-calibrate.ts --from 2026-04-13 --to 2026-10-23 --write-params
+```
+
+The script fits everything on the first half of the range and scores the
+second half against the resolved outcomes and Polymarket's own minute prices.
+On 2026-04-13 → 2026-10-23 (2,121 strikes, 190 days), **Polymarket's price was
+more accurate than the model at every horizon from 24h to 1h**. Where the two
+disagreed by 3c, 5c or 10c, the outcome did not side with the model (mean edge
+between −2.1c and +0.4c, |t| < 1). The fitted model cut log loss by 2–10% over
+a plain lognormal. The model is useful as an input: a sanity check before
+buying a "near-certain" strike, and an anchor to reprice quotes when spot
+moves. Its gaps to the market are not a trading signal on their own.
