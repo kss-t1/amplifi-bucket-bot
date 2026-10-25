@@ -93,6 +93,9 @@ export class BookFeed {
     this.teardown();
     this.books.clear();
     if (this.stopped || this.tokens.length === 0) return;
+    // A new socket gets a full silence window, or the watchdog's first check
+    // after startup reads the initial 0 as a minute of silence.
+    this.lastMessageAtMs = Date.now();
     const ws = new WebSocket(WS_URL);
     this.ws = ws;
     ws.onopen = () => {
