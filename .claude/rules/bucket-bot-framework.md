@@ -176,6 +176,8 @@ The 21-bot fleet (v2 bot1-5, v3 bot1-8, v4 bot1-8) runs from **`/home/ubuntu/amp
 
 ## Headroom exit (`HEADROOM_EXIT_ENABLED`)
 
+**OFF since 2026-10-06 on every live bot (`HEADROOM_EXIT_ENABLED=false`; the entry gate stays on).** Live result at factor 1.0, 2026-09-21 to 10-06, scored by replaying each exit forward: 249 exits, 24 right (21 of them liquidations avoided, +$3.70 each) and 225 wrong (−$0.86 each, the ride to resolution given up), **net −$116.21**, −$0.47 per exit with a 95% interval of −$0.67 to −$0.27. Break-even needs one right exit per 3.8; live was one per 10.4. The backtest's +$238.93 came from a window with 92 fleet liquidations on four wave days; the live window had 25, 23 of them on deploy day, then two in fifteen days. The insurance was paid for and never claimed. If waves return, factor 0.5 (16 exits, 11 liquidations avoided, +$3.81 in the backtest) is the cheap version to try first.
+
 The headroom gate checks a position **once, at entry**. A position opened with
 a comfortable cushion loses it as BTC drifts into the strike, and nothing
 notices until the liquidation. Every bucket-bot liquidation wave from 09-10 to
