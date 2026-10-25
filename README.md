@@ -396,3 +396,65 @@ between −2.1c and +0.4c, |t| < 1). The fitted model cut log loss by 2–10% ov
 a plain lognormal. The model is useful as an input: a sanity check before
 buying a "near-certain" strike, and an anchor to reprice quotes when spot
 moves. Its gaps to the market are not a trading signal on their own.
+
+## Lag sniper (BTC daily favourites)
+
+A separate, unleveraged bot in `lag/` that trades on Polymarket's CLOB directly
+from its own wallet. It does not use Amplifi.
+
+**What it does.** It watches every BTC daily strike resolving in the next 72
+hours. When a fresh Binance move makes a favourite (0.90–0.99) cheaper than the
+fair value above, by more than the taker fee plus 1c, it buys the ask with a
+fill-and-kill order capped at that price and holds the shares to resolution.
+
+**Why only a fresh move counts.** The fair-value model is biased against the
+market (see the table above), so comparing the two directly fires constantly on
+model error. Each strike keeps a one-minute moving baseline of
+(fair value − mid), and fair value is judged against it. Only a gap that opened
+in the last minute or so, which is what a Binance move the book has not caught
+up with looks like, triggers a buy.
+
+**Evidence.** Backtested every second of 942 strikes on the pmxt archive
+(Apr–Aug 2026), with fair-value parameters fitted on later data:
+
+| Entry price | Trades | Profit per share after fee | t-stat (grouped by day) |
+| ----------- | ------ | -------------------------- | ----------------------- |
+| 0.90–0.99   | 381    | +3.9c                      | 6.3                     |
+| ≥ 0.99      | 118    | +0.5c                      | 5.7                     |
+| < 0.50      | 2,239  | loses                      |                         |
+
+Buying the same favourites every 15 minutes without the signal made +0.8c
+(t = 0.9). Selling 60 seconds after entry lost money in every setting, so the
+edge is in holding to resolution, not in flipping. Unknowns: how many shares
+sit at the stale ask (the backtest used 1 share), and whether the edge holds
+out of sample. Paper-trade it first.
+
+**Run it.**
+
+```bash
+cp lag/.env.example lag/.env
+bun --env-file=lag/.env lag/src/index.ts       # paper by default
+bun scripts/lag-report.ts                      # P&L so far
+```
+
+Paper mode re-reads the book over REST when a signal fires and fills only what
+is still at or under the signal price, then settles against Gamma's resolution.
+Every signal, fill, miss and settlement goes to `lag/journal.{dry,live}.jsonl`.
+Paper fills and misses also record the book at that moment: every share at or
+under the signal price (`depthShares`, `depthUsd`), the same up to the highest
+price that still clears fee and margin (`probeLimit`, `probeDepth*`), and what
+the trade would have filled at that higher cap (`probeFill*`). That is the
+capacity number the backtest could not give. The bot only ever trades at the
+signal price.
+
+**Going live.** Fund an EOA with pUSD and a little POL, put the key and RPC in
+`lag/.env` (never on the command line), then:
+
+```bash
+bun --env-file=lag/.env scripts/lag-setup.ts           # check
+bun --env-file=lag/.env scripts/lag-setup.ts --apply   # approve the exchange
+```
+
+and set `DRY_RUN=false` in `lag/.env`. The bot derives its
+CLOB API key from the private key on start, and redeems resolved positions
+itself. Size is capped per trade, per strike and in total (`LAG_MAX_*_USD`).
