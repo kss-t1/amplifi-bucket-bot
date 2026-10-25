@@ -38,3 +38,15 @@ describe("fillFromResponse", () => {
     expect(fillFromResponse({ success: false, makingAmount: "9.5", takingAmount: "10" })).toBeNull();
   });
 });
+
+describe("walkAsks without a dollar cap", () => {
+  test("walking with no dollar cap counts every share under the limit", () => {
+    const asks = [
+      { price: "0.95", size: "10" },
+      { price: "0.951", size: "5" },
+      { price: "0.96", size: "100" },
+    ];
+    expect(walkAsks(asks, 0.951, Infinity)!.shares).toBe(15);
+    expect(walkAsks(asks, 0.96, Infinity)!.cost).toBeCloseTo(9.5 + 4.755 + 96, 9);
+  });
+});

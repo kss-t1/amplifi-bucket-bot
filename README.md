@@ -439,17 +439,22 @@ bun scripts/lag-report.ts                      # P&L so far
 
 Paper mode re-reads the book over REST when a signal fires and fills only what
 is still at or under the signal price, then settles against Gamma's resolution.
-Every signal, fill, miss and settlement goes to `lag/journal.{dry,live}.jsonl`,
-including how many shares were at the price, which is the capacity number
-the backtest could not give.
+Every signal, fill, miss and settlement goes to `lag/journal.{dry,live}.jsonl`.
+Paper fills and misses also record the book at that moment: every share at or
+under the signal price (`depthShares`, `depthUsd`), the same up to the highest
+price that still clears fee and margin (`probeLimit`, `probeDepth*`), and what
+the trade would have filled at that higher cap (`probeFill*`). That is the
+capacity number the backtest could not give. The bot only ever trades at the
+signal price.
 
-**Going live.** Fund an EOA with pUSD and a little POL, then:
+**Going live.** Fund an EOA with pUSD and a little POL, put the key and RPC in
+`lag/.env` (never on the command line), then:
 
 ```bash
-LAG_PRIVATE_KEY=… POLYGON_RPC_URL=… bun scripts/lag-setup.ts           # check
-LAG_PRIVATE_KEY=… POLYGON_RPC_URL=… bun scripts/lag-setup.ts --apply   # approve the exchange
+bun --env-file=lag/.env scripts/lag-setup.ts           # check
+bun --env-file=lag/.env scripts/lag-setup.ts --apply   # approve the exchange
 ```
 
-and set `DRY_RUN=false` with the key and RPC in `lag/.env`. The bot derives its
+and set `DRY_RUN=false` in `lag/.env`. The bot derives its
 CLOB API key from the private key on start, and redeems resolved positions
 itself. Size is capped per trade, per strike and in total (`LAG_MAX_*_USD`).

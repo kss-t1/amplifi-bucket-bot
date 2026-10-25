@@ -1,7 +1,7 @@
 /**
  * One-time wallet setup for the lag sniper's EOA.
  *
- *   LAG_PRIVATE_KEY=0x… POLYGON_RPC_URL=… bun scripts/lag-setup.ts [--apply]
+ *   bun --env-file=lag/.env scripts/lag-setup.ts [--apply]   (key and RPC from lag/.env)
  *
  * Prints the wallet's POL and pUSD balances and whether the CLOB exchange may
  * spend its pUSD and move its outcome tokens. With --apply it sends the

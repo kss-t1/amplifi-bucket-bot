@@ -46,10 +46,20 @@ export interface Candidate {
   fair: number;
   edge: number;
   basis: number;
+  /** Highest price that would still clear the fee and margin. */
+  maxLimit: number;
 }
 
 export function takerFee(price: number, rate: number): number {
   return rate * price * (1 - price);
+}
+
+/** Highest price p with fair − p − fee(p) ≥ margin. p + fee(p) rises over
+ *  [0, 1], so this is the smaller root of rate·p² − (1 + rate)·p + (fair − margin). */
+export function maxEntryPrice(fair: number, margin: number, rate: number): number {
+  const target = fair - margin;
+  if (rate === 0) return target;
+  return ((1 + rate) - Math.sqrt((1 + rate) ** 2 - 4 * rate * target)) / (2 * rate);
 }
 
 export class StrikeSignal {
@@ -94,6 +104,7 @@ export class StrikeSignal {
         fair,
         edge,
         basis,
+        maxLimit: maxEntryPrice(fair, this.cfg.margin, this.cfg.takerFeeRate),
       });
     }
     return out;

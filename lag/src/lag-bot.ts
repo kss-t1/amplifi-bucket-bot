@@ -13,7 +13,7 @@ import { sleepWithAbort } from "../../common/src/runtime.ts";
 import type { BinanceFeed } from "./binance.ts";
 import type { BookFeed } from "./book-feed.ts";
 import type { LagConfig } from "./config.ts";
-import type { Executor } from "./executor.ts";
+import type { Depth, Executor, Fill } from "./executor.ts";
 import { fetchTradableStrikes, type Strike } from "./markets.ts";
 import {
   fetchResolvedYesPayouts,
@@ -158,17 +158,22 @@ export class LagBot {
     }
     t.busy = true;
     try {
-      const fill = await this.executor.buy({
+      // The higher cap is only measured, never traded: the backtest tested
+      // the stale price itself.
+      const probeLimit = Math.max(c.price, Math.floor(c.maxLimit / s.tickSize + 1e-9) * s.tickSize);
+      const { fill, depth } = await this.executor.buy({
         tokenId: c.side === "YES" ? s.yesTokenId : s.noTokenId,
         yesTokenId: s.yesTokenId,
         side: c.side,
         limit: c.price,
+        probeLimit,
         usd,
         tickSize: s.tickSize,
         negRisk: s.negRisk,
       });
+      const measured = { probeLimit: round(probeLimit), ...depthFields(depth) };
       if (!fill) {
-        await this.journal({ ...entry, action: "missed", usd, latencyMs: Date.now() - now });
+        await this.journal({ ...entry, ...measured, action: "missed", usd, latencyMs: Date.now() - now });
         return;
       }
       const avg = fill.cost / fill.shares;
@@ -190,6 +195,7 @@ export class LagBot {
       await this.store.save(this.state);
       await this.journal({
         ...entry,
+        ...measured,
         action: "filled",
         usd,
         shares: round(fill.shares),
@@ -282,4 +288,21 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
 
 function round(x: number): number {
   return Math.round(x * 1e5) / 1e5;
+}
+
+/** Journal fields for the book seen at order time: shares and dollars on
+ *  offer at the signal price and at the higher probe cap, plus what the
+ *  trade would have filled at that cap. */
+export function depthFields(d: Depth | undefined): Record<string, number> {
+  if (!d) return {};
+  const shares = (f: Fill | null) => round(f?.shares ?? 0);
+  const usd = (f: Fill | null) => round(f?.cost ?? 0);
+  return {
+    depthShares: shares(d.atLimit),
+    depthUsd: usd(d.atLimit),
+    probeDepthShares: shares(d.atProbe),
+    probeDepthUsd: usd(d.atProbe),
+    probeFillShares: shares(d.probeFill),
+    probeFillUsd: usd(d.probeFill),
+  };
 }

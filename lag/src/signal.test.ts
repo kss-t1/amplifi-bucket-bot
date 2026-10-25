@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { StrikeSignal, takerFee, type Quote, type SignalConfig } from "./signal.ts";
+import { StrikeSignal, maxEntryPrice, takerFee, type Quote, type SignalConfig } from "./signal.ts";
 
 const cfg: SignalConfig = {
   margin: 0.01,
@@ -84,5 +84,24 @@ describe("StrikeSignal", () => {
     const s = warmed();
     expect(s.update(quote(121, 0.98, 0.95, 0.95))).toEqual([]);
     expect(s.update(quote(122, 0.98, 0, 0.95))).toEqual([]);
+  });
+});
+
+describe("maxEntryPrice", () => {
+  test("is the price where the edge after fee is exactly the margin", () => {
+    const p = maxEntryPrice(0.98, 0.01, 0.07);
+    expect(0.98 - p - takerFee(p, 0.07)).toBeCloseTo(0.01, 12);
+    expect(p).toBeGreaterThan(0.95);
+  });
+
+  test("with no fee it is fair minus the margin", () => {
+    expect(maxEntryPrice(0.98, 0.01, 0)).toBeCloseTo(0.97, 12);
+  });
+
+  test("a signal carries it at or above the price it fired at", () => {
+    const s = warmed();
+    const [c] = s.update(quote(121, 0.98));
+    expect(c!.maxLimit).toBeCloseTo(maxEntryPrice(0.98, 0.01, 0.07), 12);
+    expect(c!.maxLimit).toBeGreaterThanOrEqual(c!.price);
   });
 });

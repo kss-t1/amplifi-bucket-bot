@@ -26,6 +26,8 @@ export interface BuyOrder {
   yesTokenId: string;
   side: "YES" | "NO";
   limit: number;
+  /** Paper only: a higher cap to measure against the same book read. */
+  probeLimit?: number;
   usd: number;
   tickSize: number;
   negRisk: boolean;
@@ -38,10 +40,26 @@ export interface Fill {
   orderId?: string;
 }
 
+/** What the book offered when the order went in, for sizing the strategy. */
+export interface Depth {
+  /** Every share at or under the limit, ignoring the trade's dollar cap. */
+  atLimit: Fill | null;
+  /** The same at `probeLimit`. */
+  atProbe: Fill | null;
+  /** The fill the trade would have got at `probeLimit`. */
+  probeFill: Fill | null;
+}
+
+export interface BuyResult {
+  fill: Fill | null;
+  /** Paper only; live sees nothing but its own fill. */
+  depth?: Depth;
+}
+
 export interface Executor {
   readonly live: boolean;
   warm(tokenIds: string[]): Promise<void>;
-  buy(order: BuyOrder): Promise<Fill | null>;
+  buy(order: BuyOrder): Promise<BuyResult>;
 }
 
 const CLOB = "https://clob.polymarket.com";
@@ -76,7 +94,7 @@ export class PaperExecutor implements Executor {
   async warm(): Promise<void> {}
 
   /** Reads the YES book like the backtest did: NO is offered at 1 − YES bid. */
-  async buy(order: BuyOrder): Promise<Fill | null> {
+  async buy(order: BuyOrder): Promise<BuyResult> {
     const res = await fetchWithTimeout(`${CLOB}/book?token_id=${order.yesTokenId}`, {}, 5_000);
     if (!res.ok) throw new Error(`book ${res.status}`);
     const book = (await res.json()) as { bids?: Level[]; asks?: Level[] };
@@ -84,7 +102,15 @@ export class PaperExecutor implements Executor {
       order.side === "YES"
         ? (book.asks ?? [])
         : (book.bids ?? []).map((l) => ({ price: String(1 - Number(l.price)), size: l.size }));
-    return walkAsks(asks, order.limit, order.usd);
+    const probe = order.probeLimit ?? order.limit;
+    return {
+      fill: walkAsks(asks, order.limit, order.usd),
+      depth: {
+        atLimit: walkAsks(asks, order.limit, Infinity),
+        atProbe: walkAsks(asks, probe, Infinity),
+        probeFill: walkAsks(asks, probe, order.usd),
+      },
+    };
   }
 }
 
@@ -138,7 +164,7 @@ export class LiveExecutor implements Executor {
     for (const id of tokenIds) await c.getFeeExponent(id);
   }
 
-  async buy(order: BuyOrder): Promise<Fill | null> {
+  async buy(order: BuyOrder): Promise<BuyResult> {
     const c = this.requireClient();
     const tickSize = String(order.tickSize) as "0.1" | "0.01" | "0.001" | "0.0001";
     const post = () =>
@@ -154,13 +180,13 @@ export class LiveExecutor implements Executor {
         OrderType.FAK,
       );
     try {
-      return fillFromResponse((await post()) as PostOrderResponse);
+      return { fill: fillFromResponse((await post()) as PostOrderResponse) };
     } catch (err) {
       // Polymarket narrows a market's tick as its price nears 0 or 1, and the
       // client caches the old one forever. Drop it and retry once.
       if (!/tick size/i.test(String(err))) throw err;
       delete (c.tickSizes as Record<string, unknown>)[order.tokenId];
-      return fillFromResponse((await post()) as PostOrderResponse);
+      return { fill: fillFromResponse((await post()) as PostOrderResponse) };
     }
   }
 
